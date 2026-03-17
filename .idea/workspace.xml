@@ -1,16 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="规范化代码">
-      <change afterPath="$PROJECT_DIR$/test.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/attacks/attacker.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/attacker.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/attacks/generators.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/generators.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/attacks/optimizers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/optimizers.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/attacks/rankers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/rankers.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/init_env.py" beforeDir="false" afterPath="$PROJECT_DIR$/init_env.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/dataset.py" afterDir="false" />
+    <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="修改了预训练代码&#10;修改候选词生成模型，现在使用MLM模型对目标掩码进行预测&#10;修改了攻击模型，现在依次对三个被攻击模型进行攻击，而非任意一个攻击成功就结束&#10;修改了GA脚本，减少了最大迭代次数和种群大小，降低开销">
+      <change afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -26,6 +19,7 @@
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+    <option name="ROOT_SYNC" value="DONT_SYNC" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 1
@@ -144,12 +138,21 @@
       <option name="project" value="LOCAL" />
       <updated>1773647607762</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="修改了预训练代码&#10;修改候选词生成模型，现在使用MLM模型对目标掩码进行预测&#10;修改了攻击模型，现在依次对三个被攻击模型进行攻击，而非任意一个攻击成功就结束&#10;修改了GA脚本，减少了最大迭代次数和种群大小，降低开销">
+      <option name="closed" value="true" />
+      <created>1773734683795</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1773734683795</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial commit" />
     <MESSAGE value="规范化代码" />
-    <option name="LAST_COMMIT_MESSAGE" value="规范化代码" />
+    <MESSAGE value="修改了预训练代码&#10;修改候选词生成模型，现在使用MLM模型对目标掩码进行预测&#10;修改了攻击模型，现在依次对三个被攻击模型进行攻击，而非任意一个攻击成功就结束&#10;修改了GA脚本，减少了最大迭代次数和种群大小，降低开销" />
+    <option name="LAST_COMMIT_MESSAGE" value="修改了预训练代码&#10;修改候选词生成模型，现在使用MLM模型对目标掩码进行预测&#10;修改了攻击模型，现在依次对三个被攻击模型进行攻击，而非任意一个攻击成功就结束&#10;修改了GA脚本，减少了最大迭代次数和种群大小，降低开销" />
   </component>
 </project>
