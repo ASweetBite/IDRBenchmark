@@ -36,10 +36,19 @@ def main():
         ids = analyzer.extract_identifiers(code_bytes)
         return transformer.validate_and_apply(code_bytes, ids, renaming_map)
 
-    # 3. 执行攻击与评估
-    TARGET_MODEL = "CodeBERT"
-    attacker = VRTGAttacker(model_zoo, TARGET_MODEL, get_all_vars_fn, get_subs_pool_fn, rename_fn, top_k=3)
-    evaluator = TransferabilityEvaluator(attacker, model_zoo)
+        # --- 3. 执行攻击与评估 (关键修改) ---
+
+        # 删掉手动创建 attacker 的代码， evaluator 内部会循环创建
+        # attacker = VRTGAttacker(model_zoo, TARGET_MODEL, get_all_vars_fn, get_subs_pool_fn, rename_fn, top_k=3)
+
+        # 使用新的初始化方式
+
+    evaluator = TransferabilityEvaluator(
+        model_zoo=model_zoo,
+        get_all_vars_fn=get_all_vars_fn,
+        get_subs_pool_fn=get_subs_pool_fn,
+        rename_fn=rename_fn
+    )
 
     dataset = DatasetLoader.load_json("./data/megavul_test.json", max_samples=10)
     evaluator.evaluate(dataset)

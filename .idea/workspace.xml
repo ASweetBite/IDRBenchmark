@@ -1,21 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="initial commit">
-      <change afterPath="$PROJECT_DIR$/attacks/attacker.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/attacks/generators.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/attacks/optimizers.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/attacks/rankers.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/init_env.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/utils/ast_tools.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/utils/dataset.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/utils/model_zoo.py" afterDir="false" />
+    <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="规范化代码">
+      <change afterPath="$PROJECT_DIR$/test.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/VRTG-opt.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/attacks/attacker.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/attacker.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/attacks/generators.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/generators.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/attacks/optimizers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/optimizers.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/attacks/rankers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/rankers.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/init_env.py" beforeDir="false" afterPath="$PROJECT_DIR$/init_env.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/preprocessor.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/transformer.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/dataset.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -40,20 +35,27 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.VRTG-opt.executor&quot;: &quot;Run&quot;,
-    &quot;Python.init_env.executor&quot;: &quot;Run&quot;,
-    &quot;Python.main.executor&quot;: &quot;Run&quot;,
-    &quot;Python.preprocessor.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;terminal&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.VRTG-opt.executor": "Run",
+    "Python.init_env.executor": "Run",
+    "Python.main.executor": "Run",
+    "Python.preprocessor.executor": "Run",
+    "Python.test.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "git-widget-placeholder": "master",
+    "last_opened_file_path": "/Users/rrz/PycharmProjects/PythonProject",
+    "settings.editor.selected.configurable": "terminal"
   }
-}</component>
-  <component name="RunManager">
+}]]></component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$" />
+    </key>
+  </component>
+  <component name="RunManager" selected="Python.main">
     <configuration name="init_env" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="PythonProject" />
       <option name="ENV_FILES" value="" />
@@ -77,6 +79,34 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="main" type="PythonConfigurationType" factoryName="Python">
+      <module name="PythonProject" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="SDK_NAME" value="Python 3.14 (PythonProject)" />
+      <option name="WORKING_DIRECTORY" value="" />
+      <option name="IS_MODULE_SDK" value="false" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="RUN_TOOL" value="" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <list>
+      <item itemvalue="Python.main" />
+      <item itemvalue="Python.init_env" />
+    </list>
     <recent_temporary>
       <list>
         <item itemvalue="Python.init_env" />
@@ -106,11 +136,20 @@
       <option name="project" value="LOCAL" />
       <updated>1773490981780</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="规范化代码">
+      <option name="closed" value="true" />
+      <created>1773647607762</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1773647607762</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial commit" />
-    <option name="LAST_COMMIT_MESSAGE" value="initial commit" />
+    <MESSAGE value="规范化代码" />
+    <option name="LAST_COMMIT_MESSAGE" value="规范化代码" />
   </component>
 </project>
