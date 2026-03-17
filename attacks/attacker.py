@@ -63,45 +63,45 @@ class TransferabilityEvaluator:
         }
 
     def evaluate(self, dataset: List[Dict]):
+        # stats 记录格式: [attacker][victim] = {"total": 0, "fooled": 0}
         stats = {atk: {vic: {"total": 0, "fooled": 0} for vic in self.model_names}
                  for atk in self.model_names}
 
         for atk_model in self.model_names:
-            print(f"\n{'#' * 80}\n### TARGETING MODEL: {atk_model} ###\n{'#' * 80}")
+            print(f"\n{'#' * 80}\n### ATTACK CAMPAIGN: Target Model = {atk_model} ###\n{'#' * 80}")
             attacker = VRTGAttacker(self.model_zoo, atk_model, **self.attacker_params)
 
             for idx, sample in enumerate(dataset):
                 code = sample["code"]
                 orig_preds = {m: self.model_zoo.predict(code, m)[1] for m in self.model_names}
 
-                # --- 执行攻击 ---
+                # 1. 执行攻击
                 res = attacker.attack(code)
-                adv_code = res["adv_code"]
 
-                # --- 打印中间结果 ---
-                print(f"\n[Sample {idx + 1}] Result: {'SUCCESS' if res['success'] else 'FAILED'}")
-                print(f"  * Orig Pred: {res['orig_pred']} | Adv Pred: {res['adv_pred']}")
-                print(
-                    f"  * Probs:     {list(map(lambda x: round(x, 4), res['orig_probs']))} -> {list(map(lambda x: round(x, 4), res['adv_probs']))}")
+                # 2. 打印攻击结果 (只看 Target Model)
+                print(f"\n[Sample {idx + 1}] Target: {atk_model} | Status: {'SUCCESS' if res['success'] else 'FAILED'}")
+                print(f"  * Orig -> Adv Pred: {res['orig_pred']} -> {res['adv_pred']}")
 
-                # 打印 Diff
-                diff = list(difflib.unified_diff(code.splitlines(), adv_code.splitlines(), lineterm=''))
-                if diff:
-                    print(f"  * Code Diff (first 10 lines):")
-                    for line in diff[:12]:
-                        print(f"    {line}")
+                # 3. 只有在攻击成功时，才测试迁移性
+                if res['success']:
+                    adv_code = res["adv_code"]
+                    print(f"  * Transferability Test (on other models):")
 
-                # --- 评估迁移性 ---
-                print(f"  * Transferability Test:")
-                for vic_model in self.model_names:
-                    stats[atk_model][vic_model]["total"] += 1
-                    _, adv_pred = self.model_zoo.predict(adv_code, vic_model)
+                    for vic_model in self.model_names:
+                        # 统计逻辑：只有在这个模型上产生了预测翻转，才算成功迁移
+                        stats[atk_model][vic_model]["total"] += 1
 
-                    status = "✅ FOOLED" if adv_pred != orig_preds[vic_model] else "❌ ROBUST"
-                    if adv_pred != orig_preds[vic_model]:
-                        stats[atk_model][vic_model]["fooled"] += 1
+                        _, adv_pred = self.model_zoo.predict(adv_code, vic_model)
 
-                    print(f"    - {vic_model:<13}: {status} (Orig: {orig_preds[vic_model]} -> Adv: {adv_pred})")
+                        if adv_pred != orig_preds[vic_model]:
+                            stats[atk_model][vic_model]["fooled"] += 1
+                            print(f"    - {vic_model:<13}: ✅ FOOLED (Orig: {orig_preds[vic_model]} -> Adv: {adv_pred})")
+                        else:
+                            # 只有输出不同的才打印，如果保持 Robust，可以静默或者简单提示，避免刷屏
+                            # print(f"    - {vic_model:<13}: ❌ ROBUST")
+                            pass
+                else:
+                    print(f"  * Attack Failed, skipping transferability test.")
 
         self.print_summary(stats)
 

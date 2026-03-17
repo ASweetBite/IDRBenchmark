@@ -3,7 +3,7 @@ from utils.model_zoo import ModelZoo
 
 
 class GeneticAlgorithmOptimizer:
-    def __init__(self, model_zoo: ModelZoo, target_model: str, rename_fn, pop_size=10, max_generations=5):
+    def __init__(self, model_zoo: ModelZoo, target_model: str, rename_fn, pop_size=20, max_generations=10):
         self.model_zoo = model_zoo
         self.target_model = target_model
         self.rename_fn = rename_fn
