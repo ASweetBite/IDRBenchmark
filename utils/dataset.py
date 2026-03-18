@@ -8,32 +8,34 @@ class DatasetLoader:
     @staticmethod
     def load_json(filepath: str, max_samples=1000) -> List[Dict]:
         """
-        如果文件存在则加载；如果不存在，则从 HuggingFace 自动下载并转换为 list of dict 格式。
+        优先加载本地数据集；若不存在，则下载、处理并保存到本地。
         """
-        # 1. 如果有本地文件，优先加载
+        # 1. 尝试从本地加载
         if os.path.exists(filepath):
             print(f"[*] Loading dataset from {filepath}")
             with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data[:max_samples]
+                return json.load(f)[:max_samples]
 
-        # 2. 如果没有文件，自动下载 CodeXGLUE 漏洞检测数据集 (Devign)
+        # 2. 如果文件不存在，从 HuggingFace 下载
         print(f"[!] Dataset {filepath} not found.")
         print(f"[*] Downloading CodeXGLUE Defect Detection (Devign) from HuggingFace...")
 
-        # 加载测试集 (split="test")，通常用于评估和攻击
         ds = load_dataset("code_x_glue_cc_defect_detection", split="test", trust_remote_code=True)
 
         # 3. 数据标准化
         processed_data = []
-        # 只取前 max_samples
         for i in range(min(len(ds), max_samples)):
             item = ds[i]
-            # 统一字段名：code, label
             processed_data.append({
-                "code": item["func"],  # 原数据集中的字段是 'func'
-                "label": int(item["target"])  # 原数据集中的字段是 'target'
+                "code": item["func"],
+                "label": int(item["target"])
             })
 
-        print(f"[*] Successfully loaded {len(processed_data)} samples.")
+        # 4. 保存到本地 (确保目录存在)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(processed_data, f, indent=4, ensure_ascii=False)
+
+        print(f"[*] Successfully saved {len(processed_data)} samples to {filepath}")
         return processed_data
+

@@ -10,14 +10,11 @@ class GeneticAlgorithmOptimizer:
         self.pop_size = pop_size
         self.max_generations = max_generations
 
-    def run(self, code, original_pred, target_vars, subs_pool, existing_vars):
+    def run(self, code, original_pred, target_vars, subs_pool):
         def get_safe_choice(var, pool):
-            # 过滤掉冲突的变量，保留候选词
-            choices = [c for c in pool if c not in existing_vars or c == var]
+            choices = list(set(pool)) if pool else []
             return random.choice(choices) if choices else var
 
-        # --- 缓存优化：使用 dict 的 item 序列化作为 Key，比代码字符串快得多 ---
-        # Key: frozenset([(var1, cand1), (var2, cand2), ...])
         fitness_cache = {}
 
         def get_fitness_and_pred(rename_map):

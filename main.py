@@ -34,7 +34,7 @@ def main():
     def rename_fn(code_str: str, renaming_map: dict) -> str:
         code_bytes = code_str.encode("utf-8")
         ids = analyzer.extract_identifiers(code_bytes)
-        return transformer.validate_and_apply(code_bytes, ids, renaming_map)
+        return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
 
         # --- 3. 执行攻击与评估 (关键修改) ---
 

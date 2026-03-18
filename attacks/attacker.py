@@ -1,5 +1,8 @@
 import difflib
 from typing import List, Dict
+
+import json
+
 from attacks.optimizers import GeneticAlgorithmOptimizer
 from attacks.rankers import RNNS_Ranker
 from utils.model_zoo import ModelZoo
@@ -20,15 +23,14 @@ class VRTGAttacker:
 
         raw_variables = self.get_all_vars_fn(code)
         variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
-        all_existing_vars = set(raw_variables)
         subs_pool = self.get_subs_pool_fn(code, variables)
 
         # 过滤
         for var in list(subs_pool.keys()):
-            subs_pool[var] = [cand for cand in subs_pool[var] if cand not in all_existing_vars or cand == var]
             if not subs_pool[var]:
                 del subs_pool[var]
-                if var in variables: variables.remove(var)
+                if var in variables:
+                    variables.remove(var)
 
         if not variables:
             return {"success": False, "adv_code": code, "orig_probs": orig_probs, "adv_probs": orig_probs,
@@ -38,7 +40,7 @@ class VRTGAttacker:
         target_vars = ranked_vars[:self.top_k]
 
         success, adv_code, adv_probs, adv_pred = self.ga_optimizer.run(
-            code, orig_pred, target_vars, subs_pool, all_existing_vars
+            code, orig_pred, target_vars, subs_pool
         )
 
         # 返回所有必要信息
@@ -66,6 +68,7 @@ class TransferabilityEvaluator:
         # stats 记录格式: [attacker][victim] = {"total": 0, "fooled": 0}
         stats = {atk: {vic: {"total": 0, "fooled": 0} for vic in self.model_names}
                  for atk in self.model_names}
+        adversarial_test_sets = {m: [] for m in self.model_names}
 
         for atk_model in self.model_names:
             print(f"\n{'#' * 80}\n### ATTACK CAMPAIGN: Target Model = {atk_model} ###\n{'#' * 80}")
@@ -86,6 +89,11 @@ class TransferabilityEvaluator:
                 if res['success']:
                     adv_code = res["adv_code"]
                     print(f"  * Transferability Test (on other models):")
+                    adv_entry = {
+                        "code": res["adv_code"],
+                        "label": res["adv_pred"]
+                    }
+                    adversarial_test_sets[atk_model].append(adv_entry)
 
                     for vic_model in self.model_names:
                         # 统计逻辑：只有在这个模型上产生了预测翻转，才算成功迁移
@@ -102,8 +110,19 @@ class TransferabilityEvaluator:
                             pass
                 else:
                     print(f"  * Attack Failed, skipping transferability test.")
+            self.save_as_test_set(atk_model, adversarial_test_sets[atk_model])
 
         self.print_summary(stats)
+
+    def save_as_test_set(self, model_name: str, test_set: List[Dict]):
+        """将生成的对抗性样本保存为测试集文件"""
+        filename = f"test_set_adv_by_{model_name}.json"
+
+        with open(filename, 'w', encoding='utf-8') as f:
+            # 存为标准的 JSON 数组格式
+            json.dump(test_set, f, indent=4)
+
+        print(f"\n[INFO] {model_name} 生成的 {len(test_set)} 个样本已保存为测试集: {filename}")
 
     def print_summary(self, stats):
         # (保持原样即可)
