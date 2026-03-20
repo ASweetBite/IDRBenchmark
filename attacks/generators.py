@@ -1,50 +1,34 @@
 import re
 import torch
 from typing import List
-from sklearn.metrics.pairwise import cosine_similarity
 
-from utils.ast_tools import IdentifierAnalyzer, is_valid_identifier
+from utils.ast_tools import IdentifierAnalyzer, is_valid_identifier, CodeTransformer
 from utils.model_zoo import ModelZoo
+
 
 
 class CodeBasedCandidateGenerator:
     def __init__(self, model_zoo: ModelZoo, analyzer: IdentifierAnalyzer):
         self.model_zoo = model_zoo
         self.analyzer = analyzer
-        self.embedding_cache = {}
 
-    def _get_embedding_with_cache(self, code: str):
-        if code not in self.embedding_cache:
-            embedding = self.model_zoo.get_embedding(code).reshape(1, -1)
-            self.embedding_cache[code] = embedding
-        return self.embedding_cache[code]
-
-    def clear_cache(self):
-        self.embedding_cache.clear()
-
-    def generate_candidates(self, code: str, var_name: str, top_k_mlm=50, top_n_keep=10) -> List[str]:
-        self.clear_cache()
-
+    def generate_candidates(self, code: str, var_name: str, top_k_mlm=100, top_n_keep=20) -> List[str]:
+        # 【修改1】扩大 MLM 的搜索池，因为后面会被 AST 过滤掉很多
+        keywords = self.analyzer.keywords
         code_bytes = code.encode("utf-8")
         identifiers = self.analyzer.extract_identifiers(code_bytes)
 
-        # 目标变量不存在，直接返回空
         if var_name not in identifiers:
             return []
 
+        # 预测掩码
         mask_token = self.model_zoo.mlm_tokenizer.mask_token
-        masked_code = re.sub(r'\b' + re.escape(var_name) + r'\b', mask_token, code)
-
-        mask_str_idx = masked_code.find(mask_token)
-        if mask_str_idx == -1:
-            return []
-
-        start_idx = max(0, mask_str_idx - 1000)
-        end_idx = min(len(masked_code), mask_str_idx + 1000)
-        mlm_context = masked_code[start_idx:end_idx]
+        # 注意：这里只 mask 了第一次出现的位置。为了防止它匹配到变量声明(如 int var; 会生成 float 等)，
+        # 其实是可以接受的，因为后面的 AST 检查会过滤掉非法的名字。
+        masked_code = re.sub(r'\b' + re.escape(var_name) + r'\b', mask_token, code, count=1)
 
         inputs = self.model_zoo.mlm_tokenizer(
-            mlm_context, return_tensors="pt", truncation=True, max_length=512
+            masked_code, return_tensors="pt", truncation=True, max_length=512
         ).to(self.model_zoo.device)
 
         mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
@@ -53,41 +37,53 @@ class CodeBasedCandidateGenerator:
         if len(mask_token_indices) == 0:
             return []
 
-        mask_idx = mask_token_indices[0]
-
         with torch.no_grad():
             logits = self.model_zoo.mlm_model(**inputs).logits
-            mask_logits = logits[0, mask_idx, :]
+            mask_logits = logits[0, mask_token_indices[0], :]
+            # 获取更多候选，弥补清洗造成的损失
             _, top_k_indices = torch.topk(mask_logits, top_k_mlm, dim=-1)
-            candidates = [
-                self.model_zoo.mlm_tokenizer.decode([idx], clean_up_tokenization_spaces=True).strip()
+
+            # 【修改2】彻底清洗 BPE 特殊字符
+            raw_candidates = [
+                self.model_zoo.mlm_tokenizer.decode([idx]).strip()
                 for idx in top_k_indices
             ]
 
-        orig_embedding = self._get_embedding_with_cache(code)
         valid_candidates = []
 
-        for cand in set(candidates):
-            # 1. 基础合法性过滤
-            if not is_valid_identifier(cand):
-                continue
-            if cand == var_name:
-                continue
+        # 遍历去重后的候选词
+        for raw_cand in set(raw_candidates):
+            # 清理 Roberta/CodeBERT 特有的 Ġ 符号和 ## 符号
+            cand = raw_cand.replace('Ġ', '').replace('##', '').strip()
+            # 移除非字母数字的干扰字符 (有些 token 会包含标点)
+            cand = re.sub(r'[^a-zA-Z0-9_]', '', cand)
 
-            # 2. 作用域感知过滤（核心修改）
-            # 如果 cand 已存在，但与 var_name 生命周期/作用域不重叠，则允许
+            # 1. 合法性检查 (确保清洗后依然是合法的变量名)
+            if not cand or not cand[0].isalpha() and cand[0] != '_': continue
+            # 2. 关键字黑名单
+            if cand in keywords: continue
+            # 3. 避免重命名为自身
+            if cand == var_name: continue
+
+            # 【核心修改点：删除了 if cand in existing_names: continue】
+            # 允许变量重名，这能极大干扰模型的注意力机制！
+
+            # 4. AST 作用域检查 (防止破坏语法)
             if not self.analyzer.can_rename_to(code_bytes, var_name, cand):
                 continue
 
-            # 3. 生成新代码
-            new_code = re.sub(r'\b' + re.escape(var_name) + r'\b', cand, code)
-
+            # 5. 代码变换验证 (确保替换不报错)
             try:
-                new_embedding = self._get_embedding_with_cache(new_code)
-                sim = cosine_similarity(orig_embedding, new_embedding)[0][0]
-                valid_candidates.append((cand, sim))
+                _ = CodeTransformer.validate_and_apply(
+                    code_bytes, identifiers, {var_name: cand}, analyzer=self.analyzer
+                )
+                # 【修改3】直接将合法的词加入，不再计算 embedding similarity (把语义判断交给遗传算法)
+                valid_candidates.append(cand)
             except Exception:
                 continue
 
-        valid_candidates.sort(key=lambda x: x[1], reverse=True)
-        return [c[0] for c in valid_candidates[:top_n_keep]]
+            # 达到数量要求即可提前退出
+            if len(valid_candidates) >= top_n_keep:
+                break
+
+        return valid_candidates

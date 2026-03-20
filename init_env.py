@@ -1,6 +1,6 @@
 import os
+import pandas as pd
 import torch
-import torch.nn as nn
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
@@ -8,116 +8,96 @@ from transformers import (
     TrainingArguments,
     DataCollatorWithPadding
 )
-from datasets import load_dataset
+from datasets import Dataset
 from peft import get_peft_model, LoraConfig, TaskType
-from collections import Counter
+import json
 
 # 强制镜像配置
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-# 自定义带权重的 Trainer
-class WeightedTrainer(Trainer):
-    def __init__(self, class_weights, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.class_weights = class_weights.to(self.model.device)
+def prepare_binary_dataset(parquet_path, ratio=2):
+    """
+    ratio: Vul样本数量 / Safe样本数量 的比例
+    例如 ratio=2，则如果取 5000 个 Safe，就会取 10000 个 Vul
+    """
+    print(f"[*] 正在加载数据集 (按比例采样: 1 Safe : {ratio} Vul)...")
+    df = pd.read_parquet(parquet_path)
+    df['label'] = df['cwe'].apply(lambda x: 1 if x and x != "" else 0)
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # 1. 关键修改：将 labels 从输入中剥离，防止模型自动计算内部 loss
-        labels = inputs.pop("labels")
+    df_safe = df[df['label'] == 0]
+    df_vul = df[df['label'] == 1]
 
-        # 2. 现在 inputs 里没有 labels 了，模型只会返回 logits
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
+    print(f"[*] 原始分布: Safe={len(df_safe)}, Vul={len(df_vul)}")
 
-        # 3. 使用你的加权交叉熵损失
-        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+    # 设定 Safe 采样上限，例如 20,000 条
+    target_safe_count = 20000
+    # 确保不超出总数
+    n_safe = min(len(df_safe), target_safe_count)
+    n_vul = min(len(df_vul), n_safe * ratio)
 
-        # 4. 计算 loss (确保 logits 和 labels 维度对齐)
-        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+    df_safe_sampled = df_safe.sample(n=n_safe, random_state=42)
+    df_vul_sampled = df_vul.sample(n=n_vul, random_state=42)
 
-        return (loss, outputs) if return_outputs else loss
+    # 合并并打乱
+    df_final = pd.concat([df_safe_sampled, df_vul_sampled]).sample(frac=1, random_state=42).reset_index(drop=True)
 
-def prepare_data():
-    print("[*] 正在从 HuggingFace 加载全量数据集...")
-    # 使用训练集全量数据
-    dataset = load_dataset("code_x_glue_cc_defect_detection", split="train")
-    return dataset.shuffle(seed=42)
+    print(f"[+] 训练集采样完成: Safe={len(df_safe_sampled)}, Vul={len(df_vul_sampled)}")
+
+    dataset = Dataset.from_pandas(df_final[['func', 'label']])
+    return dataset
 
 
-def train_and_save_models(raw_dataset):
+def train_and_save_models(dataset):
     model_map = {
         "CodeBERT": "microsoft/codebert-base",
-        "GraphCodeBERT": "microsoft/graphcodebert-base",
-        "UniXcoder": "microsoft/unixcoder-base"
     }
 
-    # 1. 自动计算类别权重 (解决不平衡问题)
-    all_labels = [int(x['target']) for x in raw_dataset]
-    label_counts = Counter(all_labels)
-    total = len(all_labels)
-    # 计算权重: 数量越少的类，权重越高 (这里简单用总数除以每类数量)
-    weights = [total / (2 * count) for count in [label_counts[0], label_counts[1]]]
-    class_weights = torch.tensor(weights, dtype=torch.float)
-    print(f"[*] 类别分布: {label_counts}, 计算权重: {weights}")
-
-    peft_config = LoraConfig(
-        task_type=TaskType.SEQ_CLS,
-        inference_mode=False,
-        r=8,
-        lora_alpha=32,
-        lora_dropout=0.1
-    )
+    # 二分类，num_labels 固定为 2
+    num_labels = 2
+    peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
 
     for name, hf_path in model_map.items():
-        save_path = f"./models/{name.lower()}_finetuned"
-        if os.path.exists(save_path): continue
+        save_path = f"./models/binary_diversevul_{name.lower()}"
+        if os.path.exists(save_path):
+            print(f"[*] 模型已存在: {save_path}，跳过。")
+            continue
 
-        print(f"\n🚀 开始使用 LoRA 微调: {name}")
+        print(f"\n🚀 开始微调: {name}")
         tokenizer = AutoTokenizer.from_pretrained(hf_path)
-
-        # 不要使用 problem_type="single_label_classification"
-        # 因为我们自己通过 WeightedTrainer 控制 loss 计算
-        model = AutoModelForSequenceClassification.from_pretrained(hf_path, num_labels=2)
+        model = AutoModelForSequenceClassification.from_pretrained(hf_path, num_labels=num_labels)
         model = get_peft_model(model, peft_config)
 
         def tokenize_function(examples):
             return tokenizer(examples["func"], truncation=True, max_length=512)
 
-        tokenized_ds = raw_dataset.map(tokenize_function, batched=True)
-        tokenized_ds = tokenized_ds.rename_column("target", "label")
-        tokenized_ds = tokenized_ds.map(lambda x: {"label": int(x["label"])})
-        tokenized_ds = tokenized_ds.remove_columns(["func", "id", "project", "commit_id"])
-        tokenized_ds.set_format("torch")
+        tokenized_ds = dataset.map(tokenize_function, batched=True)
+        tokenized_ds.set_format("torch", columns=["input_ids", "attention_mask", "label"])
 
-        training_args = TrainingArguments(
-            output_dir=f"./temp_{name}",
-            per_device_train_batch_size=8,
-            num_train_epochs=3,  # 增加到 3 个 Epoch
-            learning_rate=5e-5,  # 稍微调高一点
-            logging_steps=50,
-            save_strategy="no",
-            report_to="none",
-            fp16=torch.cuda.is_available(),
-            dataloader_pin_memory=False
-        )
-
-        trainer = WeightedTrainer(
-            class_weights=class_weights,
+        # 使用标准 Trainer，因为数据已经均衡(1:1)，无需额外加权
+        trainer = Trainer(
             model=model,
-            args=training_args,
+            args=TrainingArguments(
+                output_dir=f"./temp_binary_{name}",
+                per_device_train_batch_size=8,
+                num_train_epochs=3,
+                learning_rate=5e-5,
+                save_strategy="epoch",
+                report_to="none",
+                fp16=torch.cuda.is_available()
+            ),
             train_dataset=tokenized_ds,
             data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
         )
 
         trainer.train()
-        model = model.merge_and_unload()
-        model.save_pretrained(save_path)
+        model.merge_and_unload().save_pretrained(save_path)
         tokenizer.save_pretrained(save_path)
-        print(f"[+] {name} 已微调并保存")
+        print(f"[+] {name} 已微调并保存至 {save_path}")
 
 
 if __name__ == "__main__":
-    data = prepare_data()
-    train_and_save_models(data)
+    # 执行流程
+    dataset = prepare_binary_dataset("./data/full_dataset.parquet")
+    train_and_save_models(dataset)

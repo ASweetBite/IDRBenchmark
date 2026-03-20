@@ -61,3 +61,39 @@ class ModelZoo:
         probs, _ = self.predict(code, target_model)
         return probs[label]
 
+    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
+        List[List[float]], List[int]]:
+        """
+        批量推断函数：极大提升 GA 运行速度
+        """
+        m = self.models.get(target_model)
+        if m is None:
+            return [[0.5, 0.5] for _ in codes], [0] * len(codes)
+
+        all_probs = []
+        all_preds = []
+
+        # 按批次处理，防止显存 OOM
+        for i in range(0, len(codes), batch_size):
+            batch_codes = codes[i:i + batch_size]
+            inputs = m["tokenizer"](
+                batch_codes, return_tensors="pt", truncation=True, max_length=512, padding="max_length"
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = m["model"](**inputs)
+                # 计算 batch 中所有样本的 softmax 概率
+                probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+
+                # 处理 batch_size 为 1 时的维度降级问题
+                if probs.ndim == 1:
+                    probs = [probs.tolist()]
+                else:
+                    probs = probs.tolist()
+
+                preds = [int(np.argmax(p)) for p in probs]
+
+                all_probs.extend(probs)
+                all_preds.extend(preds)
+
+        return all_probs, all_preds

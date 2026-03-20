@@ -1,14 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
   <component name="ChangeListManager">
     <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="修改了 requirements&#10;添加了 README">
+      <change afterPath="$PROJECT_DIR$/prepare_dataset.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/PythonProject.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/PythonProject.iml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/attacks/attacker.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/attacker.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/attacks/generators.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/generators.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/attacks/optimizers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/optimizers.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/attacks/rankers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/rankers.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/init_env.py" beforeDir="false" afterPath="$PROJECT_DIR$/init_env.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/test.py" beforeDir="false" afterPath="$PROJECT_DIR$/test.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/utils/ast_tools.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/ast_tools.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/utils/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/dataset.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/model_zoo.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/model_zoo.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -23,8 +34,29 @@
     </option>
   </component>
   <component name="Git.Settings">
+    <option name="RECENT_BRANCH_BY_REPOSITORY">
+      <map>
+        <entry key="$PROJECT_DIR$" value="master" />
+      </map>
+    </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
     <option name="ROOT_SYNC" value="DONT_SYNC" />
+  </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;ASweetBite&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/ASweetBite/VRTG4CodeModel.git&quot;,
+    &quot;accountId&quot;: &quot;8ca99420-03cc-46ce-96d4-0e7b36e15edc&quot;
+  }
+}</component>
+  <component name="HighlightingSettingsPerFile">
+    <setting file="file://$PROJECT_DIR$/.venv/Lib/site-packages/pandas/io/json/_json.py" root0="SKIP_INSPECTION" />
+    <setting file="file://$PROJECT_DIR$/.venv/Lib/site-packages/polars/_utils/deprecation.py" root0="SKIP_INSPECTION" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 1
@@ -34,23 +66,31 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.VRTG-opt.executor&quot;: &quot;Run&quot;,
-    &quot;Python.init_env.executor&quot;: &quot;Run&quot;,
-    &quot;Python.main.executor&quot;: &quot;Run&quot;,
-    &quot;Python.preprocessor.executor&quot;: &quot;Run&quot;,
-    &quot;Python.test.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/Users/rrz/PycharmProjects/PythonProject&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;terminal&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.VRTG-opt.executor": "Run",
+    "Python.init_env.executor": "Run",
+    "Python.main.executor": "Run",
+    "Python.prepare_dataset.executor": "Run",
+    "Python.preprocessor.executor": "Run",
+    "Python.test.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "CPP",
+    "last_opened_file_path": "D:/Python/WorkPlace/VRTG4CodeModel/data",
+    "node.js.detected.package.eslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "settings.editor.selected.configurable": "terminal",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="D:\Python\WorkPlace\VRTG4CodeModel\data" />
       <recent name="$PROJECT_DIR$" />
     </key>
   </component>
@@ -68,7 +108,7 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="RUN_TOOL" value="" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/init_env.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
@@ -87,14 +127,14 @@
         <env name="PYTHONUNBUFFERED" value="1" />
       </envs>
       <option name="SDK_HOME" value="" />
-      <option name="SDK_NAME" value="Python 3.14 (PythonProject)" />
+      <option name="SDK_NAME" value="Python 3.12 (VRTG4CodeModel)" />
       <option name="WORKING_DIRECTORY" value="" />
       <option name="IS_MODULE_SDK" value="false" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="RUN_TOOL" value="" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/main.py" />
-      <option name="PARAMETERS" value="" />
+      <option name="PARAMETERS" value="--dataset ./data/full_dataset.parquet" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -115,7 +155,8 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-python-sdk-0978a7220b69-9867c7d4c0a4-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-253.28294.336" />
+        <option value="bundled-js-predefined-d6986cc7102b-3aa1da707db6-JavaScript-PY-252.27397.106" />
+        <option value="bundled-python-sdk-4e2b1448bda8-9a97661f3031-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-252.27397.106" />
       </set>
     </attachedChunks>
   </component>
@@ -126,6 +167,10 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1773306185845</updated>
+      <workItem from="1773850082419" duration="539000" />
+      <workItem from="1773851213116" duration="38000" />
+      <workItem from="1773897927444" duration="13503000" />
+      <workItem from="1773993631998" duration="5766000" />
     </task>
     <task id="LOCAL-00001" summary="initial commit">
       <option name="closed" value="true" />
@@ -162,11 +207,20 @@
     <option name="localTasksCounter" value="5" />
     <servers />
   </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial commit" />
     <MESSAGE value="规范化代码" />
     <MESSAGE value="修改了预训练代码&#10;修改候选词生成模型，现在使用MLM模型对目标掩码进行预测&#10;修改了攻击模型，现在依次对三个被攻击模型进行攻击，而非任意一个攻击成功就结束&#10;修改了GA脚本，减少了最大迭代次数和种群大小，降低开销" />
     <MESSAGE value="修改了 requirements&#10;添加了 README" />
     <option name="LAST_COMMIT_MESSAGE" value="修改了 requirements&#10;添加了 README" />
+  </component>
+  <component name="com.intellij.coverage.CoverageDataManagerImpl">
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$main.coverage" NAME="main 覆盖结果" MODIFIED="1774002030848" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$init_env.coverage" NAME="init_env 覆盖结果" MODIFIED="1773995140425" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$prepare_dataset.coverage" NAME="prepare_dataset 覆盖结果" MODIFIED="1773910535415" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$test.coverage" NAME="test 覆盖结果" MODIFIED="1773999692717" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>

@@ -1,84 +1,77 @@
-import os
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from datasets import load_dataset
+import os
+import pandas as pd
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, DataCollatorWithPadding
+from sklearn.metrics import classification_report
 from tqdm import tqdm
+from datasets import Dataset
 
-# 强制镜像配置
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-
-def get_device():
-    if torch.cuda.is_available(): return "cuda"
-    if torch.backends.mps.is_available(): return "mps"
-    return "cpu"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-def evaluate_models():
-    device = get_device()
-    print(f"[*] 使用设备: {device}")
+def evaluate_models(test_data_path, model_names):
+    # 1. 加载并处理测试集
+    print(f"[*] 正在加载测试数据: {test_data_path}")
+    df = pd.read_parquet(test_data_path)
 
-    # 1. 加载测试集 (CodeXGLUE Devign)
-    print("[*] 加载测试数据集...")
-    dataset = load_dataset("code_x_glue_cc_defect_detection", split="test")
-    # 为了速度，可以先只测 1000 条
-    dataset = dataset.select(range(min(1000, len(dataset))))
+    # 二分类逻辑：cwe 有内容则为 1 (Vulnerable)，否则为 0 (Safe)
+    df['label'] = df['cwe'].apply(lambda x: 1 if x and x != "" else 0)
 
-    model_names = ["codebert", "graphcodebert", "unixcoder"]
+    # 转为 HuggingFace Dataset
+    test_ds = Dataset.from_pandas(df[['func', 'label']])
+    y_true = df['label'].tolist()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[*] 使用设备: {device}, 测试样本数: {len(test_ds)}")
+    print(f"[*] 样本分布: {pd.Series(y_true).value_counts().to_dict()}")
 
     for name in model_names:
-        model_path = f"./models/{name}_finetuned"
+        model_path = f"./models/binary_diversevul_{name.lower()}"
         if not os.path.exists(model_path):
-            print(f"[!] 模型 {name} 不存在，跳过...")
+            print(f"[!] 模型 {name} 不存在于 {model_path}，跳过。")
             continue
 
-        print(f"\n>>> 正在评估模型: {name}")
+        print(f"\n{'=' * 50}\n[*] 正在评估模型: {name}")
 
-        # 2. 加载模型和 Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
         model.eval()
 
-        # 3. 数据预处理
-        def tokenize(examples):
-            return tokenizer(examples["func"], truncation=True, max_length=512, padding="max_length")
+        # 2. Tokenization
+        def tokenize(batch):
+            return tokenizer(batch['func'], truncation=True, max_length=512)
 
-        tokenized_ds = dataset.map(tokenize, batched=True)
-        tokenized_ds = tokenized_ds.rename_column("target", "label")
-        tokenized_ds.set_format("torch", columns=["input_ids", "attention_mask", "label"])
+        tokenized_ds = test_ds.map(tokenize, batched=True)
+        tokenized_ds.set_format("torch", columns=["input_ids", "attention_mask"])
 
-        dataloader = DataLoader(tokenized_ds, batch_size=16)
+        dataloader = DataLoader(
+            tokenized_ds,
+            batch_size=32,
+            collate_fn=DataCollatorWithPadding(tokenizer=tokenizer),
+            pin_memory=True
+        )
 
-        # 4. 推理
-        all_preds = []
-        all_labels = []
+        y_pred = []
 
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Inference"):
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels = batch["label"].to(device)
+        # 3. 推理循环
+        for batch in tqdm(dataloader, desc=f"Evaluating {name}"):
+            inputs = {k: v.to(device) for k, v in batch.items()}
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                preds = torch.argmax(logits, dim=-1).cpu().numpy()
+                y_pred.extend(preds)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                preds = torch.argmax(outputs.logits, dim=-1)
-
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-        # 5. 计算指标
-        acc = accuracy_score(all_labels, all_preds)
-        f1 = f1_score(all_labels, all_preds, average="macro")
-
-        print(f"Results for {name}:")
-        print(f"  Accuracy: {acc:.4f}")
-        print(f"  F1 Score: {f1:.4f}")
-        print(
-            f"  Predictions distribution: {sum(all_preds)} positive (1) vs {len(all_preds) - sum(all_preds)} negative (0)")
-        print("-" * 30)
-        print(classification_report(all_labels, all_preds))
+        # 4. 生成报告
+        print(f"\n[+] {name} 评估报告:")
+        print(classification_report(
+            y_true,
+            y_pred,
+            target_names=["Safe", "Vulnerable"],
+            digits=4
+        ))
 
 
 if __name__ == "__main__":
-    evaluate_models()
+    # 请确保路径正确，并且测试集数据格式与训练集一致
+    evaluate_models("./data/test_dataset.parquet", ["CodeBERT"])
