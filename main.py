@@ -15,6 +15,7 @@ def main(args):
     # 1. 初始化核心组件
     model_configs = {
         "CodeBERT": "./models/binary_diversevul_codebert" if args.mode == "binary" else "./models/multi_diversevul_codebert",
+        "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
     }
 
     # 确保模型路径存在
@@ -73,7 +74,7 @@ if __name__ == "__main__":
                         help="参与攻击的样本数量")
     parser.add_argument("--dataset", type=str, required=True,
                         help="数据集路径 (parquet文件)")
-    parser.add_argument("--iterations", type=int, default=10,
+    parser.add_argument("--iterations", type=int, default=60,
                         help="遗传算法迭代次数")
 
     args = parser.parse_args()

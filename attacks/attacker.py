@@ -20,107 +20,109 @@ class VRTGAttacker:
         }
 
     def attack(self, dataset: List[Dict]):
-        # stats 记录格式: [attacker][victim] = {"total": 0, "fooled": 0}
         stats = {atk: {vic: {"total": 0, "fooled": 0} for vic in self.model_names}
                  for atk in self.model_names}
         adversarial_test_sets = {m: [] for m in self.model_names}
 
-        # 1. 初始化 Ranker 和 Optimizer (传入 iterations 参数)
-        rankers = {
-            m: RNNS_Ranker(self.model_zoo, m, self.attacker_params["rename_fn"])
-            for m in self.model_names
-        }
-        ga_optimizers = {
-            m: GeneticAlgorithmOptimizer(
-                self.model_zoo,
-                m,
-                self.attacker_params["rename_fn"],
-                iterations=self.iterations  # 传入迭代参数
-            )
-            for m in self.model_names
-        }
+        # 1. 初始化 Ranker 和 Optimizer
+        rankers = {m: RNNS_Ranker(self.model_zoo, m, self.attacker_params["rename_fn"]) for m in self.model_names}
+        ga_optimizers = {m: GeneticAlgorithmOptimizer(self.model_zoo, m, self.attacker_params["rename_fn"],
+                                                      iterations=self.iterations) for m in self.model_names}
 
         # 2. 外层循环
         for idx, sample in enumerate(dataset):
             code = sample["code"]
-            print(f"\n{'=' * 80}\n[Sample {idx + 1}/{len(dataset)}] Extracting Base Features...\n{'=' * 80}")
+            ground_truth = sample.get("label")
 
-            raw_variables = self.attacker_params["get_all_vars_fn"](code)
-            # 过滤不需要攻击的特殊变量名
-            variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
-            subs_pool = self.attacker_params["get_subs_pool_fn"](code, variables)
-
-            for var in list(subs_pool.keys()):
-                if not subs_pool[var]:
-                    del subs_pool[var]
-                    if var in variables: variables.remove(var)
-
-            if not variables: continue
-
-            # 获取所有模型对原代码的预测
+            # --- [步骤 A]：获取所有模型的预测结果 ---
             orig_predictions = {}
             for m in self.model_names:
                 probs, pred = self.model_zoo.predict(code, m)
                 orig_predictions[m] = {"probs": probs, "pred": pred}
 
-            # 阶段二：攻击
+            # 提取变量池 (仅在有模型预测正确时才真正需要，但为了逻辑统一先提取)
+            raw_variables = self.attacker_params["get_all_vars_fn"](code)
+            variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
+            subs_pool = self.attacker_params["get_subs_pool_fn"](code, variables)
+            for var in list(subs_pool.keys()):
+                if not subs_pool[var]:
+                    del subs_pool[var]
+                    if var in variables: variables.remove(var)
+            if not variables: continue
+
+            # --- [步骤 B]：攻击阶段 ---
             for atk_model in self.model_names:
-                print(f"\n  >>> ATTACK: Target={atk_model}, Mode={self.mode}, Iter={self.iterations} <<<")
                 orig_pred = orig_predictions[atk_model]["pred"]
 
-                # A. RNNS 排序
+                # 核心过滤：只有当攻击者模型本身预测正确时，才发起攻击
+                if orig_pred != ground_truth:
+                    continue
+
+                print(f"\n[Sample {idx + 1}] Target={atk_model} | Correct prediction detected. Starting Attack...")
+
+                # 计数：基准测试样本数增加
+                stats[atk_model][atk_model]["total"] += 1
+
+                # A. 排序 & B. 优化
                 ranked_vars, all_scores = rankers[atk_model].rank_variables(
                     code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred
                 )
-
-                # 【核心修改点3：动态放宽变量选择】
-                # 策略：至少选取 self.top_k (如 5) 个，或提取总变量数的前 30%（取二者较大值）
-                # 同时确保不会超过当前代码实际拥有的可用变量总数
-                dynamic_top_k = max(self.top_k, int(len(ranked_vars) * 0.3))
-                dynamic_top_k = min(dynamic_top_k, len(ranked_vars))
-
+                dynamic_top_k = min(max(self.top_k, int(len(ranked_vars) * 0.3)), len(ranked_vars))
                 target_vars = ranked_vars[:dynamic_top_k]
-
-                print(f"  * Selected Target Vars ({len(target_vars)}/{len(ranked_vars)}): {target_vars}")
                 target_scores = {var: all_scores[var] for var in target_vars}
 
-                # B. GA 优化
                 _, adv_code, adv_probs, adv_pred = ga_optimizers[atk_model].run(
-                    code=code,
-                    original_pred=orig_pred,
-                    target_vars=target_vars,
-                    subs_pool=subs_pool,
-                    variable_scores=target_scores
+                    code=code, original_pred=orig_pred, target_vars=target_vars,
+                    subs_pool=subs_pool, variable_scores=target_scores
                 )
 
-                # C. 统一判定成功标准：只要预测发生了改变 (不等于原预测)，即为成功
                 is_success = (adv_pred != orig_pred)
 
-                print(
-                    f"  * Status: {'SUCCESS' if is_success else 'FAILED'} | Orig Pred: {orig_pred} -> Adv Pred: {adv_pred}")
-
-                # 阶段三：迁移性测试
                 if is_success:
-                    adversarial_test_sets[atk_model].append({"code": adv_code, "label": adv_pred})
+                    stats[atk_model][atk_model]["fooled"] += 1
+                    print(f"  * [White-Box] ✅ SUCCESS | {orig_pred} -> {adv_pred}")
+                    adversarial_test_sets[atk_model].append({
+                        "original_code": code, "adversarial_code": adv_code,
+                        "label": ground_truth, "original_label": ground_truth
+                    })
+                else:
+                    print(f"  * [White-Box] ❌ FAILED")
 
+                # --- [步骤 C]：迁移攻击评估 (黑盒) ---
+                # 只有当白盒攻击生成的对抗样本存在时才测试
+                if is_success:
                     for vic_model in self.model_names:
-                        stats[atk_model][vic_model]["total"] += 1
-                        _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
-                        vic_orig_pred = orig_predictions[vic_model]["pred"]
+                        if vic_model == atk_model: continue
 
-                        # 迁移性判定：对抗样本在受害者模型上的预测是否改变
-                        if vic_adv_pred != vic_orig_pred:
-                            stats[atk_model][vic_model]["fooled"] += 1
-                            print(f"    - {vic_model:<13}: ✅ FOOLED ({vic_orig_pred} -> {vic_adv_pred})")
+                        vic_orig_pred = orig_predictions[vic_model]["pred"]
+                        # 迁移攻击的前提：受害者模型在原始代码上也预测正确
+                        if vic_orig_pred == ground_truth:
+                            stats[atk_model][vic_model]["total"] += 1
+                            _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
+
+                            if vic_adv_pred != vic_orig_pred:
+                                stats[atk_model][vic_model]["fooled"] += 1
+                                print(f"    - [Transfer] ✅ {vic_model} FOOLED ({vic_orig_pred} -> {vic_adv_pred})")
+                            else:
+                                print(f"    - [Transfer] ❌ {vic_model} resisted")
 
         self.print_summary(stats)
-        # ... 保存代码省略 ...
+        for atk_model in self.model_names:
+            if adversarial_test_sets[atk_model]:
+                self.save_as_test_set(atk_model, adversarial_test_sets[atk_model])
+            else:
+                print(f"[INFO] {atk_model} 没有生成任何成功的对抗样本，跳过保存。")
 
     def save_as_test_set(self, model_name: str, test_set: List[Dict]):
-        filename = f"test_set_adv_by_{model_name}.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(test_set, f, indent=4)
-        print(f"\n[INFO] {model_name} 生成的 {len(test_set)} 个样本已保存为测试集: {filename}")
+        # 改为以 .json 保存
+        filename = f"adv_test_set_{model_name}_{self.mode}.json"
+
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(test_set, f, indent=4, ensure_ascii=False)
+            print(f"[INFO] {model_name} 已保存 {len(test_set)} 个样本对至: {filename}")
+        except Exception as e:
+            print(f"[ERROR] 保存失败: {e}")
 
     def print_summary(self, stats):
         print("\n" + "=" * 90)

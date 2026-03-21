@@ -11,12 +11,46 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def evaluate_models(test_data_path, model_names):
-    # 1. 加载并处理测试集
+    # 1. 加载测试集
     print(f"[*] 正在加载测试数据: {test_data_path}")
     df = pd.read_parquet(test_data_path)
-
-    # 二分类逻辑：cwe 有内容则为 1 (Vulnerable)，否则为 0 (Safe)
     df['label'] = df['cwe'].apply(lambda x: 1 if x and x != "" else 0)
+
+    # ==========================================================
+    # 【修改：固定总样本数为 2000】
+    # ==========================================================
+    TOTAL_SAMPLES = 2000
+
+    # 统计各类别数据
+    safe_df = df[df['label'] == 0]
+    vuln_df = df[df['label'] == 1]
+
+    print(f"[*] 原数据分布: Safe={len(safe_df)}, Vuln={len(vuln_df)}")
+
+    # 检查总数据量是否够 2000
+    if len(safe_df) + len(vuln_df) < TOTAL_SAMPLES:
+        raise ValueError(f"[!] 错误：总数据量 ({len(safe_df) + len(vuln_df)}) 不足 {TOTAL_SAMPLES} 条！")
+
+    # 策略：默认尽量保持 1:1 平衡 (各 1000 条)
+    target_safe = TOTAL_SAMPLES // 2
+    target_vuln = TOTAL_SAMPLES - target_safe
+
+    # 动态补偿：如果某一边的数据不足 1000，则把剩下的额度给另一边
+    if len(safe_df) < target_safe:
+        target_safe = len(safe_df)
+        target_vuln = TOTAL_SAMPLES - target_safe
+    elif len(vuln_df) < target_vuln:
+        target_vuln = len(vuln_df)
+        target_safe = TOTAL_SAMPLES - target_vuln
+
+    # 随机采样并打乱
+    safe_sampled = safe_df.sample(n=target_safe, random_state=42)
+    vuln_sampled = vuln_df.sample(n=target_vuln, random_state=42)
+
+    df = pd.concat([safe_sampled, vuln_sampled]).sample(frac=1, random_state=42).reset_index(drop=True)
+
+    print(f"[*] 抽样后分布: Safe={len(df[df['label'] == 0])}, Vuln={len(df[df['label'] == 1])}, 总计={len(df)}")
+    # ==========================================================
 
     # 转为 HuggingFace Dataset
     test_ds = Dataset.from_pandas(df[['func', 'label']])
@@ -24,7 +58,6 @@ def evaluate_models(test_data_path, model_names):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] 使用设备: {device}, 测试样本数: {len(test_ds)}")
-    print(f"[*] 样本分布: {pd.Series(y_true).value_counts().to_dict()}")
 
     for name in model_names:
         model_path = f"./models/binary_diversevul_{name.lower()}"
@@ -74,4 +107,4 @@ def evaluate_models(test_data_path, model_names):
 
 if __name__ == "__main__":
     # 请确保路径正确，并且测试集数据格式与训练集一致
-    evaluate_models("./data/test_dataset.parquet", ["CodeBERT"])
+    evaluate_models("./data/big_vul.parquet", ["CodeBERT"])

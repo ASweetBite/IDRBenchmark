@@ -68,8 +68,13 @@ class IdentifierAnalyzer:
             'field_identifier',
             'field_declaration',
             'namespace_identifier',
-            'preproc_def',  # <-- 排除 #define 的宏名
-            'preproc_function_def'  # <-- 排除带参数的宏名
+            'preproc_def',
+            'preproc_function_def',
+            'qualified_identifier',  # 排除 Resource::Resource 这种形式
+            'type_identifier',  # 排除类名/类型名
+            'template_type',  # 排除模板类型
+            'destructor_name',  # 排除析构函数 ~Class()
+            'operator_name'  # 排除 operator+ 等
         }
 
         def traverse(node):

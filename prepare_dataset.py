@@ -1,17 +1,74 @@
-from datasets import load_dataset
+import pandas as pd
+import csv
+import pyarrow as pa
+import pyarrow.parquet as pq
+import os
 
-# 加载全量数据
-dataset = load_dataset("parquet", data_files="./data/full_dataset.parquet", split="train")
+# 修复报错：设置 500MB 限制
+csv.field_size_limit(500 * 1024 * 1024)
 
-# 1. 直接切分出 2,000 条作为测试集
-# seed 保证每次运行切分的结果一致
-dataset = dataset.train_test_split(test_size=2000, seed=42)
 
-# 2. 保存测试集
-dataset['test'].to_parquet("./data/test_dataset.parquet")
+def process_bigvul_chunked(input_csv, output_parquet, chunk_size=10000):
+    print(f"[*] 开始处理: {input_csv}")
 
-# 3. 剩下的作为训练集候选池
-dataset['train'].to_parquet("./data/train_pool.parquet")
+    valid_langs = {'C', 'C++', 'CPP'}
+    writer = None  # Parquet 写句柄
 
-print("[+] 测试集 (2000条) 已保存至 ./data/test_dataset.parquet")
-print("[+] 训练候选池已保存至 ./data/train_pool.parquet")
+    with open(input_csv, 'r', encoding='utf-8', errors='ignore') as f:
+        reader = csv.DictReader(f)
+
+        chunk = []
+        count = 0
+
+        for row in reader:
+            try:
+                lang = str(row.get('lang', '')).upper()
+                if lang not in valid_langs:
+                    continue
+
+                func = row.get('func_before')
+                cwe = row.get('CWE ID', '')
+
+                if func:
+                    chunk.append({'func': func, 'cwe': cwe if cwe else ""})
+            except:
+                continue
+
+            # 当 chunk 达到大小时写入一次
+            if len(chunk) >= chunk_size:
+                df_chunk = pd.DataFrame(chunk)
+                table = pa.Table.from_pandas(df_chunk)
+
+                # 初始化写入器
+                if writer is None:
+                    writer = pq.ParquetWriter(output_parquet, table.schema)
+
+                writer.write_table(table)
+                count += len(chunk)
+                print(f"[*] 已写入 {count} 条记录...")
+                chunk = []  # 清空内存
+
+        # 处理剩余的最后一块
+        if chunk:
+            df_chunk = pd.DataFrame(chunk)
+            table = pa.Table.from_pandas(df_chunk)
+            if writer is None:
+                writer = pq.ParquetWriter(output_parquet, table.schema)
+            writer.write_table(table)
+            count += len(chunk)
+
+    if writer:
+        writer.close()
+        print(f"[+] 处理完成! 总记录数: {count}")
+    else:
+        print("[!] 没有提取到数据。")
+
+
+if __name__ == "__main__":
+    INPUT_CSV = "data/MSR_data_cleaned.csv"
+    OUTPUT_PARQUET = "data/big_vul.parquet"
+
+    if os.path.exists(INPUT_CSV):
+        process_bigvul_chunked(INPUT_CSV, OUTPUT_PARQUET)
+    else:
+        print(f"[!] 找不到文件: {INPUT_CSV}")
