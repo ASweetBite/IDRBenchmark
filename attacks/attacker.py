@@ -80,13 +80,13 @@ class VRTGAttacker:
 
                 if is_success:
                     stats[atk_model][atk_model]["fooled"] += 1
-                    print(f"  * [White-Box] ✅ SUCCESS | {orig_pred} -> {adv_pred}")
+                    print(f"  * [Origin-Model] ✅ SUCCESS | {orig_pred} -> {adv_pred}")
                     adversarial_test_sets[atk_model].append({
                         "original_code": code, "adversarial_code": adv_code,
                         "label": ground_truth, "original_label": ground_truth
                     })
                 else:
-                    print(f"  * [White-Box] ❌ FAILED")
+                    print(f"  * [Origin-Model] ❌ FAILED")
 
                 # --- [步骤 C]：迁移攻击评估 (黑盒) ---
                 # 只有当白盒攻击生成的对抗样本存在时才测试

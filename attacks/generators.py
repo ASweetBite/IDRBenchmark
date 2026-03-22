@@ -10,30 +10,51 @@ class CodeBasedCandidateGenerator:
         self.model_zoo = model_zoo
         self.analyzer = analyzer
 
-    def generate_candidates(self, code: str, var_name: str, top_k_mlm=100, top_n_keep=20) -> List[str]:
+    def generate_candidates(self, code: str, target_name: str, identifiers=None, top_k_mlm=100, top_n_keep=20) -> List[
+        str]:
         keywords = self.analyzer.keywords
         code_bytes = code.encode("utf-8")
-        identifiers = self.analyzer.extract_identifiers(code_bytes)
 
-        if var_name not in identifiers:
-            print(f"[DEBUG-MLM] 变量 '{var_name}' 在 AST 解析出的 identifiers 中不存在。跳过。")
+        if identifiers is None:
+            identifiers = self.analyzer.extract_identifiers(code_bytes)
+
+        if target_name not in identifiers:
             return []
 
-        # 预测掩码
-        mask_token = self.model_zoo.mlm_tokenizer.mask_token
-        masked_code = re.sub(r'\b' + re.escape(var_name) + r'\b', mask_token, code, count=1)
+        target_info = identifiers[target_name][0]
+        start_byte = target_info['start']
+        end_byte = target_info['end']
 
+        mask_token = self.model_zoo.mlm_tokenizer.mask_token
+        protected_mask = f" {mask_token} "
+        mask_token_bytes = protected_mask.encode("utf-8")
+
+        masked_code_bytes = code_bytes[:start_byte] + mask_token_bytes + code_bytes[end_byte:]
+
+        context_half_size = 700
+        mask_start_in_masked = start_byte
+        mask_end_in_masked = start_byte + len(mask_token_bytes)
+
+        crop_start = max(0, mask_start_in_masked - context_half_size)
+        crop_end = min(len(masked_code_bytes), mask_end_in_masked + context_half_size)
+
+        cropped_code_bytes = masked_code_bytes[crop_start:crop_end]
+        cropped_code = cropped_code_bytes.decode("utf-8", errors="replace")
         inputs = self.model_zoo.mlm_tokenizer(
-            masked_code, return_tensors="pt", truncation=True, max_length=512
+            cropped_code, return_tensors="pt", truncation=True, max_length=512
         ).to(self.model_zoo.device)
 
         mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
         mask_token_indices = (inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
 
-        # 【重点排查点】是否因为超出 512 长度被截断？
         if len(mask_token_indices) == 0:
-            print(
-                f"    [DEBUG-MLM] 变量 '{var_name}' 找不到 Mask Token! (极大概率是代码太长，超出 max_length=512 被截断)。")
+            full_inputs = self.model_zoo.mlm_tokenizer(cropped_code, return_tensors="pt").to(self.model_zoo.device)
+            full_mask_indices = (full_inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
+
+            if len(full_mask_indices) > 0:
+                print(f"    [DEBUG-MLM] 确认: '{target_name}' 被截断了。Token 位置在 {full_mask_indices[0]}，超过了 512。")
+            else:
+                print(f"    [DEBUG-MLM] 异常: '{target_name}' 即使不截断也找不到 Mask。可能是 Tokenizer 行为异常。")
             return []
 
         with torch.no_grad():
@@ -48,7 +69,6 @@ class CodeBasedCandidateGenerator:
 
         valid_candidates = []
 
-        # --- 数据统计字典 ---
         stats = {
             "invalid_format": 0,
             "is_keyword": 0,
@@ -57,54 +77,40 @@ class CodeBasedCandidateGenerator:
             "transform_error": 0
         }
 
-        # 原始候选词去重
         unique_raw_cands = list(set(raw_candidates))
 
         for raw_cand in unique_raw_cands:
             cand = raw_cand.replace('Ġ', '').replace('##', '').strip()
             cand = re.sub(r'[^a-zA-Z0-9_]', '', cand)
 
-            # 1. 合法性检查
             if not cand or not cand[0].isalpha() and cand[0] != '_':
                 stats["invalid_format"] += 1
                 continue
-            # 2. 关键字黑名单
             if cand in keywords:
                 stats["is_keyword"] += 1
                 continue
-            # 3. 避免重命名为自身
-            if cand == var_name:
+            if cand == target_name:
                 stats["is_self"] += 1
                 continue
 
-            # 4. AST 作用域检查
-            if not self.analyzer.can_rename_to(code_bytes, var_name, cand):
+            if not self.analyzer.can_rename_to(code_bytes, target_name, cand):
                 stats["ast_conflict"] += 1
                 continue
 
-            # 5. 代码变换验证
             try:
                 _ = CodeTransformer.validate_and_apply(
-                    code_bytes, identifiers, {var_name: cand}, analyzer=self.analyzer
+                    code_bytes, identifiers, {target_name: cand}, analyzer=self.analyzer
                 )
                 valid_candidates.append(cand)
             except Exception:
                 stats["transform_error"] += 1
                 continue
 
-            # 达到数量即可退出
             if len(valid_candidates) >= top_n_keep:
                 break
 
-        # # ==========================================
-        # # 打印非常详细的过滤结果日志
-        # # ==========================================
-        # print(f"    [DEBUG-MLM] Var: '{var_name:<10}' | 最终通过: {len(valid_candidates):>2}/{top_n_keep} "
-        #       f"| 原始去重: {len(unique_raw_cands):>2} | 过滤 -> 格式非法:{stats['invalid_format']}, "
-        #       f"关键字:{stats['is_keyword']}, AST冲突:{stats['ast_conflict']}, 转换报错:{stats['transform_error']}")
-        #
-        # # 如果通过的数量极其惨淡，把 MLM 生成的原始词打印出来看看它到底生成了些什么鬼东西
-        # if len(valid_candidates) < 2:
-        #     print(f"      -> [Warning] 候选词匮乏! MLM 吐出的部分生词样本: {unique_raw_cands[:10]}")
+        # print(f"    [DEBUG-MLM] Target: '{target_name:<10}' ({entity_type}) | Valid: {len(valid_candidates):>2}/{top_n_keep} "
+        #       f"| Raw: {len(unique_raw_cands):>2} | 过滤 -> 格式:{stats['invalid_format']}, "
+        #       f"关键字:{stats['is_keyword']}, AST冲突:{stats['ast_conflict']}, 报错:{stats['transform_error']}")
 
         return valid_candidates

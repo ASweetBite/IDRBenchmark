@@ -42,7 +42,7 @@ class DatasetLoader:
             # 确定最终需要的 Safe 和 Vuln 数量
             if max_samples and max_samples < len(df):
                 # 如果指定了上限，按照 1:2 的比例分配
-                safe_needed = max_samples // 2
+                safe_needed = max_samples // 3
                 vuln_needed = max_samples - safe_needed
             else:
                 # 如果没有指定上限，按照整体 1:2 的比例最大化利用 Safe 数据

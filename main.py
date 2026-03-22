@@ -16,6 +16,7 @@ def main(args):
     model_configs = {
         "CodeBERT": "./models/binary_diversevul_codebert" if args.mode == "binary" else "./models/multi_diversevul_codebert",
         "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
+        "UniXcoder": "./models/binary_diversevul_unixcoder",
     }
 
     # 确保模型路径存在
@@ -30,13 +31,16 @@ def main(args):
     generator = CodeBasedCandidateGenerator(model_zoo, analyzer)
 
     # 2. 定义回调函数
-    def get_all_vars_fn(code_str: str) -> list:
-        return list(analyzer.extract_identifiers(code_str.encode("utf-8")).keys())
+    def get_all_identifiers_fn(code_str: str) -> list:
+        data = analyzer.extract_identifiers(code_str.encode("utf-8"))
+        return [name for name in data.keys() if name != "main"]
 
     def get_subs_pool_fn(code_str: str, variables: list) -> dict:
         pool = {}
+        code_bytes = code_str.encode("utf-8")
+        identifiers = analyzer.extract_identifiers(code_bytes)
         for var in variables:
-            pool[var] = generator.generate_candidates(code_str, var)
+            pool[var] = generator.generate_candidates(code_str, var, identifiers=identifiers)
         return pool
 
     def rename_fn(code_str: str, renaming_map: dict) -> str:
@@ -45,10 +49,10 @@ def main(args):
         return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
 
     # 3. 初始化 Attacker (传入 mode 和 iterations)
-    # 确保你的 VRTGAttacker 类初始化支持这两个新参数
+    # 确保你的VRTGAttacker 类初始化支持这两个新参数
     evaluator = VRTGAttacker(
         model_zoo=model_zoo,
-        get_all_vars_fn=get_all_vars_fn,
+        get_all_vars_fn=get_all_identifiers_fn,
         get_subs_pool_fn=get_subs_pool_fn,
         rename_fn=rename_fn,
         mode=args.mode,  # 告知攻击者当前是二分类还是多分类，用于定义攻击成功逻辑
@@ -74,7 +78,7 @@ if __name__ == "__main__":
                         help="参与攻击的样本数量")
     parser.add_argument("--dataset", type=str, required=True,
                         help="数据集路径 (parquet文件)")
-    parser.add_argument("--iterations", type=int, default=60,
+    parser.add_argument("--iterations", type=int, default=20,
                         help="遗传算法迭代次数")
 
     args = parser.parse_args()

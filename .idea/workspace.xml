@@ -4,15 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="修改使用的数据集，支持C++&#10;攻击成功率有所下降">
+    <list default="true" id="2b165c37-00ec-4e30-ac18-99c28e2f83a5" name="更改" comment="加入UniXcoder">
+      <change afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/attacks/attacker.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/attacker.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/attacks/generators.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/generators.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/attacks/optimizers.py" beforeDir="false" afterPath="$PROJECT_DIR$/attacks/optimizers.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/init_env.py" beforeDir="false" afterPath="$PROJECT_DIR$/init_env.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/prepare_dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/prepare_dataset.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/test.py" beforeDir="false" afterPath="$PROJECT_DIR$/test.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/utils/ast_tools.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/ast_tools.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/utils/dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/utils/dataset.py" afterDir="false" />
     </list>
@@ -31,7 +29,7 @@
   <component name="Git.Settings">
     <option name="RECENT_BRANCH_BY_REPOSITORY">
       <map>
-        <entry key="$PROJECT_DIR$" value="master" />
+        <entry key="$PROJECT_DIR$" value="CPP" />
       </map>
     </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
@@ -50,8 +48,11 @@
   }
 }</component>
   <component name="HighlightingSettingsPerFile">
+    <setting file="file://$USER_HOME$/AppData/Local/Programs/Python/Python312/Lib/argparse.py" root0="SKIP_INSPECTION" />
+    <setting file="file://$PROJECT_DIR$/.gitignore" root0="SKIP_INSPECTION" />
     <setting file="file://$PROJECT_DIR$/.venv/Lib/site-packages/pandas/io/json/_json.py" root0="SKIP_INSPECTION" />
     <setting file="file://$PROJECT_DIR$/.venv/Lib/site-packages/polars/_utils/deprecation.py" root0="SKIP_INSPECTION" />
+    <setting file="file://$PROJECT_DIR$/.venv/Lib/site-packages/pyarrow/parquet/core.py" root0="SKIP_INSPECTION" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 1
@@ -65,6 +66,8 @@
   &quot;keyToString&quot;: {
     &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
     &quot;Python.VRTG-opt.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ast_tools.executor&quot;: &quot;Run&quot;,
+    &quot;Python.attacker.executor&quot;: &quot;Run&quot;,
     &quot;Python.dataset.executor&quot;: &quot;Run&quot;,
     &quot;Python.init_env.executor&quot;: &quot;Run&quot;,
     &quot;Python.main.executor&quot;: &quot;Run&quot;,
@@ -75,20 +78,25 @@
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;CPP&quot;,
-    &quot;last_opened_file_path&quot;: &quot;D:/Python/WorkPlace/VRTG4CodeModel/data&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;D:/Python/WorkPlace/VRTG4CodeModel/models&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;terminal&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;editor.preferences.fonts.default&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="D:\Python\WorkPlace\VRTG4CodeModel\models" />
+      <recent name="D:\Python\WorkPlace\VRTG4CodeModel" />
       <recent name="D:\Python\WorkPlace\VRTG4CodeModel\data" />
       <recent name="$PROJECT_DIR$" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="D:\Python\WorkPlace\VRTG4CodeModel\results" />
     </key>
   </component>
   <component name="RunManager" selected="Python.main">
@@ -140,11 +148,12 @@
       <method v="2" />
     </configuration>
     <list>
-      <item itemvalue="Python.main" />
       <item itemvalue="Python.init_env" />
+      <item itemvalue="Python.main" />
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.init_env" />
         <item itemvalue="Python.init_env" />
       </list>
     </recent_temporary>
@@ -169,7 +178,12 @@
       <workItem from="1773897927444" duration="13503000" />
       <workItem from="1773993631998" duration="10044000" />
       <workItem from="1774008594705" duration="5835000" />
-      <workItem from="1774068213698" duration="7366000" />
+      <workItem from="1774068213698" duration="7628000" />
+      <workItem from="1774078141358" duration="105000" />
+      <workItem from="1774160402832" duration="13141000" />
+      <workItem from="1774179086100" duration="391000" />
+      <workItem from="1774179496781" duration="35000" />
+      <workItem from="1774179813389" duration="5300000" />
     </task>
     <task id="LOCAL-00001" summary="initial commit">
       <option name="closed" value="true" />
@@ -211,11 +225,50 @@
       <option name="project" value="LOCAL" />
       <updated>1774002325971</updated>
     </task>
-    <option name="localTasksCounter" value="6" />
+    <task id="LOCAL-00006" summary="做出了一些优化">
+      <option name="closed" value="true" />
+      <created>1774077557997</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1774077557997</updated>
+    </task>
+    <task id="LOCAL-00007" summary="加入UniXcoder">
+      <option name="closed" value="true" />
+      <created>1774174732395</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1774174732395</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="master" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+            </State>
+          </value>
+        </entry>
+      </map>
+    </option>
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="initial commit" />
@@ -223,7 +276,9 @@
     <MESSAGE value="修改了预训练代码&#10;修改候选词生成模型，现在使用MLM模型对目标掩码进行预测&#10;修改了攻击模型，现在依次对三个被攻击模型进行攻击，而非任意一个攻击成功就结束&#10;修改了GA脚本，减少了最大迭代次数和种群大小，降低开销" />
     <MESSAGE value="修改了 requirements&#10;添加了 README" />
     <MESSAGE value="修改使用的数据集，支持C++&#10;攻击成功率有所下降" />
-    <option name="LAST_COMMIT_MESSAGE" value="修改使用的数据集，支持C++&#10;攻击成功率有所下降" />
+    <MESSAGE value="做出了一些优化" />
+    <MESSAGE value="加入UniXcoder" />
+    <option name="LAST_COMMIT_MESSAGE" value="加入UniXcoder" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
@@ -237,8 +292,10 @@
     </breakpoint-manager>
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/VRTG4CodeModel$main.coverage" NAME="main 覆盖结果" MODIFIED="1774075986013" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
-    <SUITE FILE_PATH="coverage/VRTG4CodeModel$init_env.coverage" NAME="init_env 覆盖结果" MODIFIED="1774072966641" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$ast_tools.coverage" NAME="ast_tools 覆盖结果" MODIFIED="1774181954797" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$main.coverage" NAME="main 覆盖结果" MODIFIED="1774183566109" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$init_env.coverage" NAME="init_env 覆盖结果" MODIFIED="1774174839693" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/VRTG4CodeModel$attacker.coverage" NAME="attacker 覆盖结果" MODIFIED="1774182938559" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/attacks" />
     <SUITE FILE_PATH="coverage/VRTG4CodeModel$prepare_dataset.coverage" NAME="prepare_dataset 覆盖结果" MODIFIED="1774011634269" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/VRTG4CodeModel$dataset.coverage" NAME="dataset 覆盖结果" MODIFIED="1774003493778" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
     <SUITE FILE_PATH="coverage/VRTG4CodeModel$test.coverage" NAME="test 覆盖结果" MODIFIED="1774074978289" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
