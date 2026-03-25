@@ -98,7 +98,6 @@ class VRTGAttacker:
                         if vic_model == atk_model: continue
 
                         vic_orig_pred = orig_predictions[vic_model]["pred"]
-                        # 迁移攻击的前提：受害者模型在原始代码上也预测正确
                         if vic_orig_pred == ground_truth:
                             stats[atk_model][vic_model]["total"] += 1
                             _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
