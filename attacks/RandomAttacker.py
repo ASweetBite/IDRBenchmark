@@ -70,13 +70,14 @@ class RandomAttacker:
         return attack_success, adv_code, adv_probs, adv_pred
 
     def attack(self, dataset: List[Dict]):
-        """执行批量随机改名攻击，统计ASR"""
-        stats = {model: {"total": 0, "fooled": 0} for model in self.model_names}
+        stats = {atk: {vic: {"total": 0, "fooled": 0} for vic in self.model_names}
+                 for atk in self.model_names}
+
         adv_samples = {model: [] for model in self.model_names}
 
-        print("\n" + "="*80)
-        print("🔍 开始执行【第一部分：随机改名攻击】")
-        print("="*80)
+        print("\n" + "=" * 80)
+        print("🔍 开始执行【随机改名攻击】")
+        print("=" * 80)
 
         for idx, sample in enumerate(dataset):
             code = sample["code"]
@@ -85,26 +86,31 @@ class RandomAttacker:
             for target_model in self.model_names:
                 # 执行攻击
                 success, adv_code, adv_probs, adv_pred = self.attack_sample(code, ground_truth, target_model)
-                stats[target_model]["total"] += 1
+
+                # 【修改2】更新对角线数据 (Self-Attack)
+                stats[target_model][target_model]["total"] += 1
 
                 if success:
-                    stats[target_model]["fooled"] += 1
+                    stats[target_model][target_model]["fooled"] += 1
                     adv_samples[target_model].append({
                         "original_code": code,
                         "adversarial_code": adv_code,
                         "label": ground_truth
                     })
-                    print(f"[Sample {idx+1}] {target_model} | 随机改名 ✅ 攻击成功")
+                    print(f"[Sample {idx + 1}] {target_model} | 随机改名 ✅ 攻击成功")
                 else:
-                    print(f"[Sample {idx+1}] {target_model} | 随机改名 ❌ 攻击失败")
+                    # print(f"[Sample {idx+1}] {target_model} | 随机改名 ❌ 攻击失败")
+                    pass
 
-        # 打印随机攻击ASR结果
+        # 打印摘要
         self.print_summary(stats)
 
+        # 【修改3】生成 asr_matrix
         asr_matrix = {}
         for atk_m in self.model_names:
             asr_matrix[atk_m] = {}
             for vic_m in self.model_names:
+                # 访问二维 stats
                 total = stats[atk_m][vic_m]["total"]
                 fooled = stats[atk_m][vic_m]["fooled"]
                 asr = (fooled / total * 100) if total > 0 else 0.0
@@ -113,10 +119,12 @@ class RandomAttacker:
         return asr_matrix  # 返回字典结果
 
     def print_summary(self, stats):
-        print("\n" + "="*60)
-        print("📊 随机改名攻击 - 攻击成功率(ASR)")
-        print("="*60)
-        for model, res in stats.items():
+        print("\n" + "=" * 60)
+        print("📊 随机改名攻击 - 攻击成功率(ASR) [Self-Attack Only]")
+        print("=" * 60)
+        for model in self.model_names:
+            # 仅打印对角线数据
+            res = stats[model][model]
             asr = (res["fooled"] / res["total"] * 100) if res["total"] > 0 else 0.0
             print(f"{model:<15} | ASR: {asr:.2f}% ({res['fooled']}/{res['total']})")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")

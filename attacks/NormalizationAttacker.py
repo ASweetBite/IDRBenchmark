@@ -1,3 +1,4 @@
+import os
 import re
 import json
 from typing import List, Dict, Tuple
@@ -79,7 +80,7 @@ class NormalizationAttacker:
 
                 if is_success:
                     stats[atk_model][atk_model]["fooled"] += 1
-                    print(f"  * [White-Box] ✅ SUCCESS | {orig_pred} -> {adv_pred}")
+                    print(f"  * [Normalization] ✅ SUCCESS | {orig_pred} -> {adv_pred}")
                     adversarial_test_sets[atk_model].append({
                         "original_code": code,
                         "adversarial_code": adv_code,
@@ -87,25 +88,25 @@ class NormalizationAttacker:
                         "original_label": ground_truth,
                         "rename_map": rename_map
                     })
-                    self.save_as_test_set(atk_model, adversarial_test_sets[atk_model])
                 else:
-                    print(f"  * [White-Box] ❌ FAILED (Still predicted {adv_pred})")
+                    # print(f"  * [White-Box] ❌ FAILED (Still predicted {adv_pred})")
+                    pass
 
-                # --- [步骤 C]：迁移攻击评估 (黑盒) ---
-                if is_success:
-                    for vic_model in self.model_names:
-                        if vic_model == atk_model: continue
-
-                        vic_orig_pred = orig_predictions[vic_model]["pred"]
-                        if vic_orig_pred == ground_truth:
-                            stats[atk_model][vic_model]["total"] += 1
-                            _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
-
-                            if vic_adv_pred != vic_orig_pred:
-                                stats[atk_model][vic_model]["fooled"] += 1
-                                print(f"    - [Transfer] ✅ {vic_model} FOOLED")
-                            else:
-                                print(f"    - [Transfer] ❌ {vic_model} resisted")
+                # # --- [步骤 C]：迁移攻击评估 (黑盒) ---
+                # if is_success:
+                #     for vic_model in self.model_names:
+                #         if vic_model == atk_model: continue
+                #
+                #         vic_orig_pred = orig_predictions[vic_model]["pred"]
+                #         if vic_orig_pred == ground_truth:
+                #             stats[atk_model][vic_model]["total"] += 1
+                #             _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
+                #
+                #             if vic_adv_pred != vic_orig_pred:
+                #                 stats[atk_model][vic_model]["fooled"] += 1
+                #                 print(f"    - [Transfer] ✅ {vic_model} FOOLED")
+                #             else:
+                #                 print(f"    - [Transfer] ❌ {vic_model} resisted")
 
         # 打印最终矩阵
         self.print_summary(stats)
@@ -126,11 +127,15 @@ class NormalizationAttacker:
         return asr_matrix  # 返回字典结果
 
     def save_as_test_set(self, model_name: str, test_set: List[Dict]):
+        result_dir = "./results"
+        if not os.path.exists(result_dir):
+            os.makedirs(result_dir)
         filename = f"norm_test_set_{model_name}_{self.mode}.json"
+        file_path = os.path.join(result_dir, filename)
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
+            with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(test_set, f, indent=4, ensure_ascii=False)
-            print(f"[INFO] {model_name} 已保存 {len(test_set)} 个样本至: {filename}")
+            print(f"[INFO] {model_name} 已保存 {len(test_set)} 个样本至: {file_path}")
         except Exception as e:
             print(f"[ERROR] 保存失败: {e}")
 
