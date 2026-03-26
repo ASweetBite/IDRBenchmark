@@ -4,11 +4,12 @@ import numpy as np
 import argparse
 import os
 
+from attacks.NormalizationAttacker import NormalizationAttacker
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.model_zoo import ModelZoo
 from utils.dataset import DatasetLoader
 from attacks.generators import CodeBasedCandidateGenerator
-from attacks.attacker import VRTGAttacker,RandomRenamingAttacker
+from attacks.IRTGAttacker import IRTGAttacker,RandomRenamingAttacker
 
 
 def main(args):
@@ -50,7 +51,7 @@ def main(args):
 
     # 3. 初始化 Attacker (传入 mode 和 iterations)
     # 确保你的VRTGAttacker 类初始化支持这两个新参数
-    evaluator = VRTGAttacker(
+    evaluator = IRTGAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,
         get_subs_pool_fn=get_subs_pool_fn,
@@ -65,7 +66,15 @@ def main(args):
     dataset = loader.load_parquet_dataset(filepath=args.dataset, mode=args.mode, max_samples=args.samples)
 
     # 5. 执行攻击
-    evaluator.attack(dataset)
+    # evaluator.attack(dataset)
+
+    normalier = NormalizationAttacker(
+        model_zoo=model_zoo,
+        get_all_vars_fn=get_all_identifiers_fn,
+        rename_fn=rename_fn,
+        mode=args.mode
+    )
+    normalier.attack(dataset)
 
     # ==============================================
     # 【新增】第一部分：执行 随机改名攻击

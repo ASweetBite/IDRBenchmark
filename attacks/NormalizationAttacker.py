@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple
 from utils.model_zoo import ModelZoo
 
 
-class VRTGNormalizationAttacker:
+class NormalizationAttacker:
     def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, rename_fn, mode="binary"):
         """
         :param model_zoo: 模型动物园对象
@@ -87,6 +87,7 @@ class VRTGNormalizationAttacker:
                         "original_label": ground_truth,
                         "rename_map": rename_map
                     })
+                    self.save_as_test_set(atk_model, adversarial_test_sets[atk_model])
                 else:
                     print(f"  * [White-Box] ❌ FAILED (Still predicted {adv_pred})")
 
