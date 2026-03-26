@@ -8,7 +8,7 @@ from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.model_zoo import ModelZoo
 from utils.dataset import DatasetLoader
 from attacks.generators import CodeBasedCandidateGenerator
-from attacks.attacker import VRTGAttacker
+from attacks.attacker import VRTGAttacker,RandomRenamingAttacker
 
 
 def main(args):
@@ -66,6 +66,24 @@ def main(args):
 
     # 5. 执行攻击
     evaluator.attack(dataset)
+
+    # ==============================================
+    # 【新增】第一部分：执行 随机改名攻击
+    # ==============================================
+    print("\n" + "=" * 80)
+    print("🚀  RUNNING RANDOM RENAMING ATTACK (随机改名攻击)")
+    print("=" * 80)
+
+    random_attacker = RandomRenamingAttacker(
+        model_zoo=model_zoo,
+        get_all_vars_fn=get_all_identifiers_fn,
+        get_subs_pool_fn=get_subs_pool_fn,
+        rename_fn=rename_fn,
+        mode=args.mode
+    )
+    random_attacker.set_analyzer(analyzer)  # 绑定AST分析器
+    random_stats, random_adv_samples = random_attacker.attack(dataset)
+
 
 
 if __name__ == "__main__":
