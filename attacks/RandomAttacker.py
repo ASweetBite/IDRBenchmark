@@ -100,7 +100,17 @@ class RandomAttacker:
 
         # 打印随机攻击ASR结果
         self.print_summary(stats)
-        return stats, adv_samples
+
+        asr_matrix = {}
+        for atk_m in self.model_names:
+            asr_matrix[atk_m] = {}
+            for vic_m in self.model_names:
+                total = stats[atk_m][vic_m]["total"]
+                fooled = stats[atk_m][vic_m]["fooled"]
+                asr = (fooled / total * 100) if total > 0 else 0.0
+                asr_matrix[atk_m][vic_m] = round(asr, 2)
+
+        return asr_matrix  # 返回字典结果
 
     def print_summary(self, stats):
         print("\n" + "="*60)

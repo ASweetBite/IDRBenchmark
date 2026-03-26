@@ -114,6 +114,17 @@ class NormalizationAttacker:
             if adversarial_test_sets[atk_model]:
                 self.save_as_test_set(atk_model, adversarial_test_sets[atk_model])
 
+        asr_matrix = {}
+        for atk_m in self.model_names:
+            asr_matrix[atk_m] = {}
+            for vic_m in self.model_names:
+                total = stats[atk_m][vic_m]["total"]
+                fooled = stats[atk_m][vic_m]["fooled"]
+                asr = (fooled / total * 100) if total > 0 else 0.0
+                asr_matrix[atk_m][vic_m] = round(asr, 2)
+
+        return asr_matrix  # 返回字典结果
+
     def save_as_test_set(self, model_name: str, test_set: List[Dict]):
         filename = f"norm_test_set_{model_name}_{self.mode}.json"
         try:

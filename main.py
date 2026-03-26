@@ -5,11 +5,12 @@ import argparse
 import os
 
 from attacks.NormalizationAttacker import NormalizationAttacker
+from attacks.RandomAttacker import RandomAttacker
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.model_zoo import ModelZoo
 from utils.dataset import DatasetLoader
 from attacks.generators import CodeBasedCandidateGenerator
-from attacks.IRTGAttacker import IRTGAttacker,RandomRenamingAttacker
+from attacks.IRTGAttacker import IRTGAttacker
 
 
 def main(args):
@@ -66,7 +67,7 @@ def main(args):
     dataset = loader.load_parquet_dataset(filepath=args.dataset, mode=args.mode, max_samples=args.samples)
 
     # 5. 执行攻击
-    # evaluator.attack(dataset)
+    asr_matrix_vrtg = evaluator.attack(dataset)
 
     normalier = NormalizationAttacker(
         model_zoo=model_zoo,
@@ -74,16 +75,13 @@ def main(args):
         rename_fn=rename_fn,
         mode=args.mode
     )
-    normalier.attack(dataset)
+    asr_matrix_norm = normalier.attack(dataset)
 
-    # ==============================================
-    # 【新增】第一部分：执行 随机改名攻击
-    # ==============================================
     print("\n" + "=" * 80)
     print("🚀  RUNNING RANDOM RENAMING ATTACK (随机改名攻击)")
     print("=" * 80)
 
-    random_attacker = RandomRenamingAttacker(
+    random_attacker = RandomAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,
         get_subs_pool_fn=get_subs_pool_fn,
@@ -91,7 +89,57 @@ def main(args):
         mode=args.mode
     )
     random_attacker.set_analyzer(analyzer)  # 绑定AST分析器
-    random_stats, random_adv_samples = random_attacker.attack(dataset)
+    asr_matrix_random= random_attacker.attack(dataset)
+
+    print("\n" + "=" * 80)
+    print("🏆  MODEL DEFENSE SCORES (模型防御性综合评分)")
+    print("权重分配：VRTG(70%) + Normalization(20%) + Random(10%)")
+    print("=" * 80)
+
+    model_names = model_zoo.model_names
+    defense_scores = {}
+
+    # 权重定义
+    W_VRTG = 0.7
+    W_NORM = 0.2
+    W_RAND = 0.1
+
+    for m in model_names:
+        # 1. 提取该模型作为目标时的 Self-ASR (对角线数据)
+        # get(m, {}).get(m, 0.0) 确保即便某个模型没数据也不会报错
+        vrtg_self_asr = asr_matrix_vrtg.get(m, {}).get(m, 0.0)
+        norm_self_asr = asr_matrix_norm.get(m, {}).get(m, 0.0)
+        rand_self_asr = asr_matrix_random.get(m, {}).get(m, 0.0)
+
+        # 2. 计算防御率 (Defense Success Rate = 100 - ASR)
+        vrtg_def = 100 - vrtg_self_asr
+        norm_def = 100 - norm_self_asr
+        rand_def = 100 - rand_self_asr
+
+        # 3. 加权求和得到综合鲁棒性得分
+        total_score = (vrtg_def * W_VRTG) + (norm_def * W_NORM) + (rand_def * W_RAND)
+
+        defense_scores[m] = {
+            "total": round(total_score, 2),
+            "vrtg_asr": round(vrtg_self_asr, 2),
+            "norm_asr": round(norm_self_asr, 2),
+            "rand_asr": round(rand_self_asr, 2),
+            "vrtg_def": round(vrtg_def, 2)
+        }
+
+    # 打印评分结果表
+    header = f"{'Target Model':<20} | {'VRTG ASR':<12} | {'Norm ASR':<12} | {'Rand ASR':<12} | {'OVERALL SCORE'}"
+    print(header)
+    print("-" * len(header))
+
+    # 按照综合得分从高到低排序 (最难被攻破的模型排在第一)
+    ranked_models = sorted(defense_scores.items(), key=lambda x: x[1]['total'], reverse=True)
+
+    for model_name, data in ranked_models:
+        print(
+            f"{model_name:<20} | {data['vrtg_asr']:>10.2f}% | {data['norm_asr']:>10.2f}% | {data['rand_asr']:>10.2f}% | {data['total']:>13} / 100")
+
+    print("=" * 80 + "\n")
 
 
 
