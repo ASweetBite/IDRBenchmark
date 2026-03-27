@@ -20,20 +20,67 @@ class NormalizationAttacker:
 
     def _generate_sequential_mapping(self, code: str, variables: List[str]) -> Dict[str, str]:
         """
-        根据变量在代码中出现的先后顺序，生成 {原变量名: VAR_N} 的映射表
+        根据变量/函数类型及在代码中出现的先后顺序，生成映射表：
+        int -> int_1, int_2...
+        float -> float_1, float_2...
+        function -> func_1, func_2...
+        others -> var_1, var_2...
         """
-        # 记录每个变量第一次出现的位置
-        var_positions = {}
+
+        # 1. 预处理：识别所有函数名 (函数名后通常紧跟 '(' )
+        # 这种匹配方式可以识别大部分 C/C++/Java 等风格的函数调用和定义
+        found_funcs = set(re.findall(r'\b(\w+)\s*\(', code))
+
+        # 2. 定义类型匹配规则 (针对 C 风格语言)
+        # 匹配 int 相关类型: int, long, short, size_t, uint32_t 等
+        int_pattern = r'\b(int|long|short|size_t|u?int\d+_t)\b'
+        # 匹配 float 相关类型: float, double
+        float_pattern = r'\b(float|double)\b'
+
+        # 3. 记录每个变量第一次出现的位置，并进行分类
+        var_info = []
         for var in variables:
             pos = code.find(var)
-            if pos != -1:
-                var_positions[var] = pos
+            if pos == -1:
+                continue
 
-        # 按出现位置排序
-        sorted_vars = sorted(var_positions.keys(), key=lambda x: var_positions[x])
+            # 判断类别
+            if var in found_funcs:
+                category = "func"
+            else:
+                # 通过正则搜索该变量的定义处来判断类型
+                # 匹配模式：类型名 + 任意空格/星号 + 变量名
+                # 例如：int *ptr 或 float value
+                is_int = re.search(int_pattern + r'\s*\*?\s*\b' + re.escape(var) + r'\b', code)
+                is_float = re.search(float_pattern + r'\s*\*?\s*\b' + re.escape(var) + r'\b', code)
 
-        # 生成映射表
-        return {var: f"VAR_{i + 1}" for i, var in enumerate(sorted_vars)}
+                if is_int:
+                    category = "int"
+                elif is_float:
+                    category = "float"
+                else:
+                    category = "var"  # 默认兜底类型
+
+            var_info.append({
+                "name": var,
+                "pos": pos,
+                "category": category
+            })
+
+        # 4. 按出现位置排序，确保 VAR_1, VAR_2 是按顺序的
+        var_info.sort(key=lambda x: x["pos"])
+
+        # 5. 生成映射表
+        mapping = {}
+        counters = {"int": 1, "float": 1, "func": 1, "var": 1}
+
+        for item in var_info:
+            cat = item["category"]
+            new_name = f"{cat}_{counters[cat]}"
+            mapping[item["name"]] = new_name
+            counters[cat] += 1
+
+        return mapping
 
     def attack(self, dataset: List[Dict]):
         # 初始化统计数据 (与原版一致)
