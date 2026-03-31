@@ -17,20 +17,22 @@ def main(args):
     # 1. 初始化核心组件
     model_configs = {
         "CodeBERT": "./models/binary_diversevul_codebert" if args.mode == "binary" else "./models/multi_diversevul_codebert",
-        # "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
-        # "UniXcoder": "./models/binary_diversevul_unixcoder",
+        "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
+        "UniXcoder": "./models/binary_diversevul_unixcoder",
     }
 
+    # 确保模型路径存在
     for name, path in model_configs.items():
         if not os.path.exists(path):
             print(f"[!] 模型路径不存在: {path}")
             return
 
     model_zoo = ModelZoo(model_configs)
-    analyzer = IdentifierAnalyzer(lang="cpp")
+    analyzer = IdentifierAnalyzer(lang="cpp")  # 假设初始化支持语言指定
     transformer = CodeTransformer()
     generator = CodeBasedCandidateGenerator(model_zoo, analyzer)
 
+    # 2. 定义回调函数
     def get_all_identifiers_fn(code_str: str) -> list:
         data = analyzer.extract_identifiers(code_str.encode("utf-8"))
         return [name for name in data.keys() if name != "main"]
@@ -48,31 +50,31 @@ def main(args):
         ids = analyzer.extract_identifiers(code_bytes)
         return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
 
+    # 3. 初始化 Attacker (传入 mode 和 iterations)
+    # 确保你的VRTGAttacker 类初始化支持这两个新参数
     evaluator = IRTGAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,
         get_subs_pool_fn=get_subs_pool_fn,
         rename_fn=rename_fn,
-        mode=args.mode,
-        iterations=args.iterations,
-        run_mode=args.run_mode
+        mode=args.mode,  # 告知攻击者当前是二分类还是多分类，用于定义攻击成功逻辑
+        iterations=args.iterations  # 告知遗传算法迭代次数
     )
 
+    # 4. 加载数据 (使用修改后的 loader)
     loader = DatasetLoader()
-    print(f"[*] Loading dataset in {args.mode} mode | Run mode: {args.run_mode}...")
+    print(f"[*] Loading dataset in {args.mode} mode...")
     dataset = loader.load_parquet_dataset(filepath=args.dataset, mode=args.mode, max_samples=args.samples)
 
+    # 5. 执行攻击
     asr_matrix_vrtg = evaluator.attack(dataset)
-
-    if args.run_mode == "dataset":
-        return
-    normalizer = NormalizationAttacker(
+    normalier = NormalizationAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,
         rename_fn=rename_fn,
         mode=args.mode
     )
-    asr_matrix_norm = normalizer.attack(dataset)
+    asr_matrix_norm = normalier.attack(dataset)
 
     print("\n" + "=" * 80)
     print("🚀  RUNNING RANDOM RENAMING ATTACK (随机改名攻击)")
@@ -139,9 +141,11 @@ def main(args):
     print("=" * 80 + "\n")
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="对抗性样本生成攻击工具")
 
+    # 参数定义
     parser.add_argument("--mode", type=str, choices=["binary", "multi"], default="binary",
                         help="选择运行模式: binary (二分类) 或 multi (细分)")
     parser.add_argument("--samples", type=int, default=100,
@@ -150,11 +154,10 @@ if __name__ == "__main__":
                         help="数据集路径 (parquet文件)")
     parser.add_argument("--iterations", type=int, default=20,
                         help="遗传算法迭代次数")
-    parser.add_argument("--run_mode", type=str, choices=["attack", "dataset"], default="attack",
-                        help="运行模式：attack(成功即停止) 或 dataset(固定跑满世代，保存所有改名前后样本用于迁移攻击)")
 
     args = parser.parse_args()
 
+    # 设置随机种子
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
