@@ -6,38 +6,73 @@ from utils.model_zoo import ModelZoo
 
 
 class NormalizationAttacker:
-    def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, rename_fn, mode="binary"):
+    def __init__(self, model_zoo: ModelZoo, get_all_vars_with_types_fn, rename_fn, mode="binary"):
         """
-        :param model_zoo: 模型动物园对象
-        :param get_all_vars_fn: 获取变量的函数
-        :param rename_fn: 执行替换的底层函数（通常是对接正则表达式或AST）
+        :param model_zoo: 模型对象
+        :param get_all_vars_with_types_fn: 函数应返回 List[Tuple[变量名, 类型字符串]]
+        :param rename_fn: 执行替换的底层函数
         :param mode: 任务模式
         """
         self.model_zoo = model_zoo
         self.model_names = model_zoo.model_names
         self.mode = mode
-        self.get_all_vars_fn = get_all_vars_fn
-        self.rename_fn = rename_fn  # 虽然我们自己生成映射，但实际替换还是建议用原本的 rename_fn 确保语法正确
+        # 注意：此函数现在需要返回 (name, type) 的元组
+        self.get_all_vars_fn = get_all_vars_with_types_fn
+        self.rename_fn = rename_fn
 
-    def _generate_sequential_mapping(self, code: str, variables: List[str]) -> Dict[str, str]:
+    def _generate_type_aware_mapping(self, code: str, var_type_pairs: List[Tuple[str, str]]) -> Dict[str, str]:
         """
-        根据变量在代码中出现的先后顺序，生成 {原变量名: VAR_N} 的映射表
+        根据变量类型和出现顺序生成映射表：
+        1. 指针 -> pointer_N
+        2. int -> int_N
+        3. char -> char_N
+        4. 类对象 -> 类名_N
         """
         # 记录每个变量第一次出现的位置
-        var_positions = {}
-        for var in variables:
-            pos = code.find(var)
+        var_info = []
+        for var_name, var_type in var_type_pairs:
+            pos = code.find(var_name)
             if pos != -1:
-                var_positions[var] = pos
+                var_info.append({
+                    "name": var_name,
+                    "type": var_type.strip(),
+                    "pos": pos
+                })
 
-        # 按出现位置排序
-        sorted_vars = sorted(var_positions.keys(), key=lambda x: var_positions[x])
+        # 按在代码中出现的先后顺序排序
+        sorted_vars = sorted(var_info, key=lambda x: x["pos"])
 
-        # 生成映射表
-        return {var: f"VAR_{i + 1}" for i, var in enumerate(sorted_vars)}
+        mapping = {}
+        counters = {}  # 存储每种类型的计数器，例如 {"int": 1, "pointer": 2, "UserClass": 1}
+
+        for item in sorted_vars:
+            name = item["name"]
+            v_type = item["type"]
+
+            # --- 判定重命名分类 ---
+            # 1. 如果是指针 (包含 * 号)
+            if "*" in v_type:
+                category = "pointer"
+            # 2. 如果是 char 型
+            elif "char" in v_type.lower():
+                category = "char"
+            # 3. 如果是 int 型 (包括 long, short, unsigned int 等)
+            elif "int" in v_type.lower() or "long" in v_type.lower() or "short" in v_type.lower():
+                category = "int"
+            # 4. 其他情况视为类对象或自定义类型
+            else:
+                # 去掉类型中的空格，处理类似 "struct MyClass" 的情况，取最后一部分
+                category = v_type.split()[-1]
+
+            # 更新计数器并生成新名字
+            counters[category] = counters.get(category, 0) + 1
+            new_name = f"{category}_{counters[category]}"
+            mapping[name] = new_name
+
+        return mapping
 
     def attack(self, dataset: List[Dict]):
-        # 初始化统计数据 (与原版一致)
+        # 初始化统计数据
         stats = {atk: {vic: {"total": 0, "fooled": 0} for vic in self.model_names}
                  for atk in self.model_names}
         adversarial_test_sets = {m: [] for m in self.model_names}
@@ -46,32 +81,37 @@ class NormalizationAttacker:
             code = sample["code"]
             ground_truth = sample.get("label")
 
-            # --- [步骤 A]：获取所有模型的原始预测 ---
+            # --- [步骤 A]：获取原始预测 ---
             orig_predictions = {}
             for m in self.model_names:
                 probs, pred = self.model_zoo.predict(code, m)
                 orig_predictions[m] = {"probs": probs, "pred": pred}
 
-            # 提取变量并过滤（逻辑同原版）
-            raw_variables = self.get_all_vars_fn(code)
-            variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
-            if not variables:
+            # --- [步骤 B]：获取变量及其类型并过滤 ---
+            # 这里的 get_all_vars_fn 预期返回 List[Tuple[name, type]]
+            raw_var_pairs = self.get_all_vars_fn(code)
+
+            # 过滤逻辑：去掉全大写和系统特定前缀
+            filtered_pairs = [
+                (name, v_type) for name, v_type in raw_var_pairs
+                if not name.isupper() and not name.startswith(("av_", "spapr_", "kvm"))
+            ]
+
+            if not filtered_pairs:
                 continue
 
-            # --- [步骤 B]：攻击阶段 (顺序重命名) ---
-            # 生成规律化的重命名映射表 {"x": "VAR_1", "y": "VAR_2"...}
-            rename_map = self._generate_sequential_mapping(code, variables)
+            # --- [步骤 C]：生成基于类型的归一化映射 ---
+            rename_map = self._generate_type_aware_mapping(code, filtered_pairs)
             # 使用映射表修改代码
             adv_code = self.rename_fn(code, rename_map)
 
             for atk_model in self.model_names:
                 orig_pred = orig_predictions[atk_model]["pred"]
 
-                # 只有当模型原本预测正确时，才纳入攻击统计
                 if orig_pred != ground_truth:
                     continue
 
-                print(f"\n[Sample {idx + 1}] Target={atk_model} | Normalizing Variables to VAR_N...")
+                print(f"\n[Sample {idx + 1}] Target={atk_model} | Type-Aware Normalizing...")
                 stats[atk_model][atk_model]["total"] += 1
 
                 # 检查重命名后的预测结果
@@ -80,72 +120,40 @@ class NormalizationAttacker:
 
                 if is_success:
                     stats[atk_model][atk_model]["fooled"] += 1
-                    print(f"  * [Normalization] ✅ SUCCESS | {orig_pred} -> {adv_pred}")
+                    print(f"  * [Success] {orig_pred} -> {adv_pred}")
                     adversarial_test_sets[atk_model].append({
                         "original_code": code,
                         "adversarial_code": adv_code,
                         "label": ground_truth,
-                        "original_label": ground_truth,
                         "rename_map": rename_map
                     })
-                else:
-                    # print(f"  * [White-Box] ❌ FAILED (Still predicted {adv_pred})")
-                    pass
 
-                # # --- [步骤 C]：迁移攻击评估 (黑盒) ---
-                # if is_success:
-                #     for vic_model in self.model_names:
-                #         if vic_model == atk_model: continue
-                #
-                #         vic_orig_pred = orig_predictions[vic_model]["pred"]
-                #         if vic_orig_pred == ground_truth:
-                #             stats[atk_model][vic_model]["total"] += 1
-                #             _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
-                #
-                #             if vic_adv_pred != vic_orig_pred:
-                #                 stats[atk_model][vic_model]["fooled"] += 1
-                #                 print(f"    - [Transfer] ✅ {vic_model} FOOLED")
-                #             else:
-                #                 print(f"    - [Transfer] ❌ {vic_model} resisted")
+                # (可选) 迁移攻击部分可根据需要在此开启...
 
-        # 打印最终矩阵
         self.print_summary(stats)
+
         # 保存结果
         for atk_model in self.model_names:
             if adversarial_test_sets[atk_model]:
                 self.save_as_test_set(atk_model, adversarial_test_sets[atk_model])
 
-        asr_matrix = {}
-        for atk_m in self.model_names:
-            asr_matrix[atk_m] = {}
-            for vic_m in self.model_names:
-                total = stats[atk_m][vic_m]["total"]
-                fooled = stats[atk_m][vic_m]["fooled"]
-                asr = (fooled / total * 100) if total > 0 else 0.0
-                asr_matrix[atk_m][vic_m] = round(asr, 2)
-
-        return asr_matrix  # 返回字典结果
+        return stats
 
     def save_as_test_set(self, model_name: str, test_set: List[Dict]):
         result_dir = "./results"
-        if not os.path.exists(result_dir):
-            os.makedirs(result_dir)
-        filename = f"norm_test_set_{model_name}_{self.mode}.json"
+        if not os.path.exists(result_dir): os.makedirs(result_dir)
+        filename = f"type_norm_test_{model_name}_{self.mode}.json"
         file_path = os.path.join(result_dir, filename)
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(test_set, f, indent=4, ensure_ascii=False)
-            print(f"[INFO] {model_name} 已保存 {len(test_set)} 个样本至: {file_path}")
-        except Exception as e:
-            print(f"[ERROR] 保存失败: {e}")
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(test_set, f, indent=4, ensure_ascii=False)
+        print(f"[INFO] 已保存至: {file_path}")
 
     def print_summary(self, stats):
         print("\n" + "=" * 90)
-        print("📊 NORMALIZATION ATTACK SUCCESS RATE (ASR %)")
+        print("📊 TYPE-AWARE NORMALIZATION ATTACK SUCCESS RATE")
         print("=" * 90)
         header = f"{'Source Model':<20} |"
-        for m in self.model_names:
-            header += f" {m:<13} |"
+        for m in self.model_names: header += f" {m:<13} |"
         print(header)
         print("-" * len(header))
         for atk_m in self.model_names:
