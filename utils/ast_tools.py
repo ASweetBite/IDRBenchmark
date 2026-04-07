@@ -36,9 +36,6 @@ class IdentifierAnalyzer:
         tree = self.parser.parse(source_code)
         identifiers = defaultdict(list)
 
-        # 核心新增：记录当前代码片段内真正发生过声明/定义的变量或函数名
-        defined_locally = set()
-
         scope_stack = [{
             "id": 0,
             "start": 0,
@@ -57,97 +54,19 @@ class IdentifierAnalyzer:
             'for_statement'
         }
 
+        # 【修正】去除了 'qualified_identifier'，以支持重命名类外定义 (MyClass::Method)
         excluded_parents = {
             'preproc_def',
             'preproc_function_def',
             'type_identifier',
             'template_type',
-            'namespace_identifier'
+            'namespace_identifier'  # 排除 namespace 名字本身
         }
 
         forbidden_node_types = {
-            'destructor_name',
-            'operator_name'
+            'destructor_name',  # ~MyClass
+            'operator_name'  # operator+
         }
-
-        # 核心新增：精准判断一个标识符节点是否是“定义/声明”本身，而不是单纯的使用
-        def is_definition_node(node):
-            parent = node.parent
-            if not parent:
-                return False
-
-            # 1. 结构体、类、枚举、命名空间的名字
-            if parent.type in ['class_specifier', 'struct_specifier', 'enum_specifier', 'namespace_definition']:
-                if parent.child_by_field_name('name') == node:
-                    return True
-
-            # 2. 枚举值
-            if parent.type == 'enumerator':
-                if parent.children and parent.children[0] == node:
-                    return True
-
-            # 对于类的外部方法实现 (如 MyClass::myFunc)，只认定最右边的函数名为定义
-            if parent.type == 'qualified_identifier':
-                if parent.child_by_field_name('name') != node:
-                    return False
-
-            # 向上穿透声明修饰符 (如指针、引用、数组、函数等)
-            curr = node
-            p = parent
-            while p and p.type in [
-                'pointer_declarator', 'reference_declarator',
-                'array_declarator', 'function_declarator',
-                'parenthesized_declarator', 'qualified_identifier'
-            ]:
-                curr = p
-                p = p.parent
-
-            if not p:
-                return False
-
-            # 3. 初始化声明 (如 int a = 5;)
-            if p.type == 'init_declarator':
-                decl_node = p.child_by_field_name('declarator')
-                if decl_node == curr:
-                    return True
-                # 防御性回退：声明符通常在等号前
-                eq_node = None
-                for child in p.children:
-                    if child.type == '=':
-                        eq_node = child
-                        break
-                if eq_node and curr.start_byte < eq_node.start_byte:
-                    return True
-
-            # 4. 普通声明、字段声明、参数声明
-            if p.type in ['declaration', 'field_declaration', 'parameter_declaration',
-                          'optional_parameter_declaration']:
-                # 排除 extern 声明，因为它的实际生存周期在外部
-                if p.type == 'declaration':
-                    for child in p.children:
-                        if child.type == 'storage_class_specifier' and source_code[
-                            child.start_byte:child.end_byte].decode("utf-8") == 'extern':
-                            return False
-
-                type_node = p.child_by_field_name('type')
-                value_node = p.child_by_field_name('default_value')
-                # 只要它不是类型节点，也不是默认值节点，就是被声明的标识符
-                if curr != type_node and curr != value_node:
-                    return True
-
-            # 5. 函数定义 (例如 void func() {})
-            if p.type == 'function_definition':
-                decl_node = p.child_by_field_name('declarator')
-                if decl_node == curr:
-                    return True
-
-            # 6. for 范围循环 (例如 for (auto x : vec))
-            if p.type == 'for_range_loop':
-                decl_node = p.child_by_field_name('declarator')
-                if decl_node == curr:
-                    return True
-
-            return False
 
         def traverse(node):
             nonlocal scope_counter
@@ -171,6 +90,7 @@ class IdentifierAnalyzer:
                 })
                 entered_scope = True
 
+            # 捕捉普通标识符 和 结构体/类的成员调用或方法声明 (field_identifier)
             if node.type in ["identifier", "field_identifier"]:
                 parent_type = node.parent.type if node.parent else None
                 name = source_code[node.start_byte:node.end_byte].decode("utf-8")
@@ -179,11 +99,8 @@ class IdentifierAnalyzer:
                     pass
                 elif name not in self.keywords and parent_type not in excluded_parents:
 
-                    # 核心新增：如果检测到该符号在此代码片段内被“定义”，则加入局部白名单
-                    if is_definition_node(node):
-                        defined_locally.add(name)
-
                     # 1. 精准判断是否为函数/方法声明
+                    # (由于指针或引用，function_declarator 可能会被包几层，我们需要向上穿透)
                     is_func_decl = False
                     curr = node.parent
                     while curr and curr.type in ['qualified_identifier', 'pointer_declarator', 'reference_declarator',
@@ -194,7 +111,7 @@ class IdentifierAnalyzer:
 
                     is_constructor = False
 
-                    # 2. 检查类外定义的构造函数
+                    # 2. 检查类外定义的构造函数 (例如 DataProcessor::DataProcessor)
                     if node.parent and node.parent.type == "qualified_identifier":
                         scope_node = node.parent.child_by_field_name('scope')
                         name_node = node.parent.child_by_field_name('name')
@@ -226,12 +143,12 @@ class IdentifierAnalyzer:
 
                     entity_type = "function" if (is_func_decl or is_func_call or is_method_call) else "variable"
 
-                    # 5. 过滤掉纯类成员变量的安全保护
+                    # 5. 【关键修复】如果是 field_identifier，它必须是方法声明或方法调用，才放行。
+                    # 如果不是声明也不是方法调用，说明它是纯粹的类成员变量，为了安全保持不触碰。
                     is_plain_field = (node.type == "field_identifier" and not is_method_call and not is_func_decl)
 
                     if not is_constructor and not is_plain_field:
                         current_scope = scope_stack[-1]
-                        # 这里继续收集，待到最后一步进行过滤
                         identifiers[name].append({
                             "start": node.start_byte,
                             "end": node.end_byte,
@@ -247,18 +164,8 @@ class IdentifierAnalyzer:
             if entered_scope:
                 scope_stack.pop()
 
-        # 开始遍历 AST
         traverse(tree.root_node)
-
-        # 核心新增：最后过滤阶段！
-        # 仅保留存在于局部名单 (`defined_locally`) 中的标识符，抛弃 `printf`、外接库等纯引用标识符
-        filtered_identifiers = {
-            name: occurences
-            for name, occurences in identifiers.items()
-            if name in defined_locally
-        }
-
-        return filtered_identifiers
+        return dict(identifiers)
 
     def get_identifier_scope_ranges(self, source_code: bytes, var_name: str):
         # ... 保持不变 ...
