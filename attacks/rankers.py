@@ -1,5 +1,5 @@
 import numpy as np
-import torch
+import heapq
 from utils.model_zoo import ModelZoo
 
 
@@ -13,7 +13,6 @@ class RNNS_Ranker:
     def _get_word_embedding(self, word: str):
         if word in self._embedding_cache:
             return self._embedding_cache[word]
-
         emb = self.model_zoo.get_embedding(word)
         self._embedding_cache[word] = emb
         return emb
@@ -25,51 +24,76 @@ class RNNS_Ranker:
             return -1.0
         return np.dot(vec1, vec2) / (norm1 * norm2)
 
-    def rank_variables(self, code, variables, subs_pool, reference_label, test_sample_size=8):
-        # 1. 获取原始代码在目标标签下的初始概率
+    def rank_variables(self, code, variables, subs_pool, reference_label,
+                       test_sample_size=3, top_k=5, filter_short_vars=True):
+        """
+        :param test_sample_size: 每个变量挑选多少个最相似的词去测试 (建议设为 3)
+        :param top_k: 最终只返回排名前 K 的重要变量
+        :param filter_short_vars: 是否过滤掉长度 <= 2 的变量 (如 i, j, x)
+        """
+        # 1. 获取原始概率
         orig_prob = self.model_zoo.predict_label_conf(code, reference_label, self.target_model)
-        scores = []
 
-        for var in variables:
+        # 2. 启发式优化：过滤过短的、无语义的循环变量
+        if filter_short_vars:
+            valid_vars = [v for v in variables if len(v) > 2]
+        else:
+            valid_vars = variables
+
+        # 记录所有需要批量推断的任务
+        mutation_tasks = []  # 格式: [(var_name, renamed_code), ...]
+
+        # 3. 准备所有候选替换代码
+        for var in valid_vars:
             candidates = subs_pool.get(var, [])
             if not candidates:
                 continue
 
-            # A. 获取原始变量的 embedding
             var_emb = self._get_word_embedding(var)
 
-            # B. 计算所有候选词与原变量的相似度
-            candidate_sims = []
-            for cand in candidates:
-                cand_emb = self._get_word_embedding(cand)
-                sim = self._cosine_similarity(var_emb, cand_emb)
-                candidate_sims.append((cand, sim))
+            # 计算相似度
+            candidate_sims = [
+                (cand, self._cosine_similarity(var_emb, self._get_word_embedding(cand)))
+                for cand in candidates
+            ]
 
-            # C. 按照相似度从大到小排序，选择最近邻 (Nearest Neighbors)
-            candidate_sims.sort(key=lambda x: x[1], reverse=True)
+            # 优化点A：使用 heapq 代替 sort 获取 Top-N 最相似候选词，时间复杂度 O(C + N log C)
+            top_candidates = heapq.nlargest(test_sample_size, candidate_sims, key=lambda x: x[1])
 
-            # D. 挑选最相似的 Top-N 个候选词进入测试阶段
-            test_subs = [item[0] for item in candidate_sims[:test_sample_size]]
-            # ================== RNNS 核心逻辑结束 ==================
+            # 生成替换后的代码，并加入任务队列
+            for cand, _ in top_candidates:
+                renamed_code = self.rename_fn(code, {var: cand})
+                mutation_tasks.append((var, renamed_code))
 
-            max_prob_drop = -float('inf')
+        # 边界情况处理：如果没有任何可替换的词
+        if not mutation_tasks:
+            return [], {}
 
-            # 只对筛选出的最相似的词进行攻击测试
-            for test_sub in test_subs:
-                renamed_code = self.rename_fn(code, {var: test_sub})
-                # 预测替换后的概率
-                new_prob = self.model_zoo.predict_label_conf(renamed_code, reference_label, self.target_model)
-                prob_drop = orig_prob - new_prob
+        # ================= 核心提速区 =================
+        # 4. 提取所有代码进行 GPU 批量推断 (Global Batching)
+        codes_to_predict = [task[1] for task in mutation_tasks]
 
-                if prob_drop > max_prob_drop:
-                    max_prob_drop = prob_drop
+        # 调用 ModelZoo 提供的 batch_predict
+        # batch_size 取决于你的显存大小，ModelZoo 默认是 32
+        all_probs, _ = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
 
-            scores.append((var, max_prob_drop))
+        # 5. 整理推断结果，计算每个变量造成的最大概率下降
+        var_max_drop = {var: -float('inf') for var in valid_vars}
 
-        # 按概率下降幅度从大到小排序（最重要的变量排在前面）
-        scores.sort(key=lambda x: x[1], reverse=True)
+        for (var, _), probs in zip(mutation_tasks, all_probs):
+            new_prob = probs[reference_label]
+            prob_drop = orig_prob - new_prob
 
-        ranked_vars = [var for var, score in scores]
-        score_dict = {var: score for var, score in scores}
+            if prob_drop > var_max_drop[var]:
+                var_max_drop[var] = prob_drop
+
+        # 过滤掉没有成功替换的变量 (值为负无穷的)
+        valid_scores = [(var, score) for var, score in var_max_drop.items() if score != -float('inf')]
+
+        # 6. 优化点B：使用 heapq 只获取全局下降最大的 Top-K 个变量，而不是全量排序
+        top_k_vars_with_scores = heapq.nlargest(top_k, valid_scores, key=lambda x: x[1])
+
+        ranked_vars = [var for var, score in top_k_vars_with_scores]
+        score_dict = {var: score for var, score in top_k_vars_with_scores}
 
         return ranked_vars, score_dict

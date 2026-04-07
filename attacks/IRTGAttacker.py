@@ -70,10 +70,9 @@ class IRTGAttacker:
 
                 # 变量排序
                 ranked_vars, all_scores = rankers[atk_model].rank_variables(
-                    code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred
+                    code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred, top_k=max(self.top_k, int(len(variables) * 0.3))
                 )
-                dynamic_top_k = min(max(self.top_k, int(len(ranked_vars) * 0.3)), len(ranked_vars))
-                target_vars = ranked_vars[:dynamic_top_k]
+                target_vars = ranked_vars
                 target_scores = {var: all_scores[var] for var in target_vars}
 
                 # 运行优化器
