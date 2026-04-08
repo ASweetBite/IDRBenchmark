@@ -88,9 +88,9 @@ class CodeBasedCandidateGenerator:
             return "".join(predicted_words)
 
     def generate_candidates(self, code: str, target_name: str, identifiers=None,
-                            top_k_mlm=50, top_n_keep=20,
+                            top_k_mlm=80, top_n_keep=50,
                             preserve_style: bool = True,
-                            semantic_threshold: float = 0.5,
+                            semantic_threshold: float = 0.2,
                             context_ratio: float = 0.3) -> List[str]:
         """
         新增参数:
@@ -240,18 +240,22 @@ class CodeBasedCandidateGenerator:
 
         final_candidates = []
 
-        def _filter_and_add(candidate_list, quota):
+        # Modified _filter_and_add
+        def _filter_and_add(candidate_list, quota, is_full_context=False):
             added_count = 0
             for cand in candidate_list:
                 if added_count >= quota:
                     break
                 if cand in keywords or cand == target_name: continue
                 if preserve_style and not self._matches_style(original_style, cand): continue
-                if semantic_threshold > 0 and original_emb is not None:
+
+                # CRITICAL FIX 1: Bypass semantic check if it's a full context guess
+                if not is_full_context and semantic_threshold > 0 and original_emb is not None:
                     cand_emb = self._get_word_embedding(cand)
                     if cand_emb is not None:
                         sim = F.cosine_similarity(original_emb.unsqueeze(0), cand_emb.unsqueeze(0)).item()
                         if sim < semantic_threshold: continue
+
                 if not self.analyzer.can_rename_to(code_bytes, target_name, cand): continue
                 try:
                     _ = CodeTransformer.validate_and_apply(code_bytes, identifiers, {target_name: cand},
@@ -263,14 +267,17 @@ class CodeBasedCandidateGenerator:
             return added_count
 
         # 优先填满 Full Context 词汇
-        actual_full_added = _filter_and_add(unique_full, target_full_quota)
+        actual_full_added = _filter_and_add(unique_full, target_full_quota, is_full_context=True)
 
         # 如果 Full Context 没填满配额，把名额让给 Sub Mask
         remaining_quota = top_n_keep - actual_full_added
-        _filter_and_add(unique_sub, remaining_quota)
-
+        _filter_and_add(unique_sub, remaining_quota, is_full_context=False)
         # 最后去重返回
-        return list(dict.fromkeys(final_candidates))
+        unique_final = list(dict.fromkeys(final_candidates))
+
+        if len(unique_final) > top_n_keep:
+            return random.sample(unique_final, top_n_keep)
+        return unique_final
 
     def _build_length_pool(self, mlm_seeds: List[str], local_identifiers: List[str]) -> Dict[int, List[str]]:
         """
