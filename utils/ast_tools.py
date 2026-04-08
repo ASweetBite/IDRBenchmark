@@ -298,6 +298,35 @@ class IdentifierAnalyzer:
                     return False
         return True
 
+    def analyze_format(self, name: str) -> dict:
+        # 1. 提取前缀 (如 _ 或 __)
+        prefix_match = re.match(r'^_+', name)
+        prefix = prefix_match.group(0) if prefix_match else ""
+        pure_name = name[len(prefix):]
+
+        if not pure_name:
+            return {"prefix": prefix, "lengths": [], "style": "special", "count": 0}
+
+        # 2. 判定风格：只要有下划线，就是 snake_case
+        if '_' in pure_name:
+            style = "snake_case"
+            # 严格按下划线拆分，不关心单词内部是否有大写
+            words = pure_name.split('_')
+        else:
+            # 没有下划线，才尝试按驼峰拆分
+            words = re.findall(r'[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z][a-z0-9]|\b)', pure_name)
+            if pure_name[0].isupper():
+                style = "PascalCase"
+            else:
+                style = "camelCase"
+
+        return {
+            "prefix": prefix,
+            "lengths": [len(w) for w in words],
+            "style": style,
+            "count": len(words)
+        }
+
 
 def is_valid_identifier(name: str) -> bool:
     pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
