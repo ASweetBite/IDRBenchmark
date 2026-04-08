@@ -1,8 +1,10 @@
 import re
+import random
 import torch
-import torch.nn.functional as F
 import itertools
-from typing import List
+from typing import List, Dict
+import torch.nn.functional as F
+from collections import defaultdict
 
 from utils.ast_tools import IdentifierAnalyzer, is_valid_identifier, CodeTransformer
 
@@ -268,3 +270,107 @@ class CodeBasedCandidateGenerator:
 
         # 最后去重返回
         return list(dict.fromkeys(final_candidates))
+
+    def _build_length_pool(self, mlm_seeds: List[str], local_identifiers: List[str]) -> Dict[int, List[str]]:
+        """
+        优化 A：构建长度索引词库
+        将所有可用的单词（来自模型预测和本地代码）按长度分类
+        """
+        pool = defaultdict(set)
+
+        # 1. 处理 MLM 种子词和本地标识符
+        # 我们需要把复合词拆开，获取最基础的单词块
+        all_raw_names = mlm_seeds + local_identifiers + self.common_affixes
+
+        for name in all_raw_names:
+            # 统一拆分为纯单词块
+            parts = re.findall(r'[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z][a-z0-9]|\b)|[a-z0-9]+', name)
+            for part in parts:
+                clean_part = part.lower()
+                if len(clean_part) > 0:
+                    pool[len(clean_part)].add(clean_part)
+
+        # 转回列表方便 random.sample
+        return {length: list(words) for length, words in pool.items()}
+
+    def _assemble_by_style(self, words: List[str], format_info: dict) -> str:
+        style = format_info['style']
+        prefix = format_info['prefix']
+
+        # 只要是 snake_case，就用下划线连接
+        if style == "snake_case":
+            # words 里面已经是对应长度的候选词了
+            # 这里直接用 '_' 连接即可
+            assembled = "_".join(words)
+        elif style == "PascalCase":
+            assembled = "".join(w.capitalize() for w in words)
+        elif style == "camelCase":
+            assembled = words[0].lower() + "".join(w.capitalize() for w in words[1:]) if words else ""
+        else:
+            assembled = "".join(words)
+
+        return prefix + assembled
+
+    def generate_structural_candidates(self, code: str, target_name: str, top_n_keep=20) -> List[str]:
+        """
+        核心方法：生成与原变量名格式完全相同的候选词
+        """
+        code_bytes = code.encode("utf-8")
+        identifiers = self.analyzer.extract_identifiers(code_bytes)
+
+        if target_name not in identifiers:
+            return []
+
+        # 1. 解析原始格式 (使用你在 ast_tools 中新增的方法)
+        format_info = self.analyzer.analyze_format(target_name)
+        target_lengths = format_info['lengths']
+
+        # 2. 获取原材料
+        # 为了保证语义，这里可以调用你原来的 MLM 逻辑获取 base_seeds
+        # 假设这里我们已经拿到了基础词 pool
+        # 同时也拿到了当前代码中定义的本地变量名作为补充
+        local_names = list(identifiers.keys())
+
+        # 注意：这里需要你原有的 MLM 预测逻辑获取 seeds，此处简化处理
+        mlm_seeds = []  # 实际运行时应调用模型预测
+
+        length_pool = self._build_length_pool(mlm_seeds, local_names)
+
+        # 3. 尝试组装候选词
+        structural_candidates = []
+        max_attempts = 100  # 防止死循环
+
+        for _ in range(max_attempts):
+            sampled_words = []
+            possible = True
+
+            for length in target_lengths:
+                if length in length_pool and len(length_pool[length]) > 0:
+                    sampled_words.append(random.choice(length_pool[length]))
+                else:
+                    possible = False
+                    break
+
+            if possible and sampled_words:
+                new_name = self._assemble_by_style(sampled_words, format_info)
+                structural_candidates.append(new_name)
+
+            # 去重
+            structural_candidates = list(dict.fromkeys(structural_candidates))
+            if len(structural_candidates) >= top_n_keep * 2:  # 多生成一些用于过滤
+                break
+
+        # 4. 验证过滤 (合法性、作用域冲突等)
+        valid_candidates = []
+        for cand in structural_candidates:
+            if cand == target_name or cand in self.analyzer.keywords:
+                continue
+
+            # 静态检查
+            if self.analyzer.can_rename_to(code_bytes, target_name, cand):
+                valid_candidates.append(cand)
+
+            if len(valid_candidates) >= top_n_keep:
+                break
+
+        return valid_candidates
