@@ -53,9 +53,15 @@ class GeneticAlgorithmOptimizer:
                 cache_key = frozenset(rename_map.items())
 
                 if cache_key not in fitness_cache:
-                    mutated_code = self.rename_fn(code, rename_map)
-                    codes_to_predict.append(mutated_code)
-                    keys_to_predict.append(cache_key)
+                    # --- 修改点：增加异常捕获 ---
+                    try:
+                        mutated_code = self.rename_fn(code, rename_map)
+                        codes_to_predict.append(mutated_code)
+                        keys_to_predict.append(cache_key)
+                    except Exception:
+                        # 如果这组重命名方案冲突，将其记录为极低的适应度或跳过
+                        fitness_cache[cache_key] = (float('-inf'), original_pred, code, None)
+                        continue
 
             if codes_to_predict:
                 batch_probs, batch_preds = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
@@ -145,23 +151,14 @@ from utils.model_zoo import ModelZoo
 
 
 class GreedyOptimizer:
-    def __init__(self, model_zoo: ModelZoo, target_model: str, rename_fn, run_mode="attack"):
+    def __init__(self, model_zoo: ModelZoo, target_model: str, rename_fn, run_mode="attack", iterations=None, **kwargs):
         self.model_zoo = model_zoo
         self.target_model = target_model
         self.rename_fn = rename_fn
         self.run_mode = run_mode
+        self.iterations = iterations
 
     def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
-        """
-        贪心搜索算法实现
-        :param code: 原始代码
-        :param original_pred: 原始预测标签
-        :param target_vars: 待攻击变量列表
-        :param subs_pool: 候选词池 {var: [cand1, cand2, ...]}
-        :param variable_scores: 变量显著度得分 {var: score}
-        """
-        # 1. 变量排序 (对应论文 4.2 节：按词显著度/显著度排序)
-        # 贪心算法通常先修改对模型影响最大的变量
         if variable_scores:
             sorted_vars = sorted(target_vars, key=lambda v: variable_scores.get(v, 0), reverse=True)
         else:
@@ -170,44 +167,44 @@ class GreedyOptimizer:
         current_code = code
         current_best_probs = None
         current_best_pred = original_pred
-
-        # 记录整个过程中的最佳结果（用于非攻击模式或攻击失败时返回）
         overall_best_fitness = float('-inf')
         overall_best_code = code
 
-        # 2. 逐个变量进行贪心搜索
         for var in sorted_vars:
             candidates = list(set(subs_pool.get(var, [])))
             if not candidates:
                 continue
 
-            # 为当前变量生成所有候选代码，准备批处理预测
             codes_to_predict = []
             for cand in candidates:
                 if cand == var: continue
-                # 仅替换当前这一个变量
-                temp_code = self.rename_fn(current_code, {var: cand})
-                codes_to_predict.append((cand, temp_code))
+
+                # --- 修改重点：增加 try-except 捕获作用域冲突 ---
+                try:
+                    temp_code = self.rename_fn(current_code, {var: cand})
+                    codes_to_predict.append((cand, temp_code))
+                except Exception as e:
+                    # 如果发生作用域冲突或重命名错误，直接忽略这个候选词
+                    # print(f"    [Skip] {var} -> {cand} due to conflict")
+                    continue
+                # ----------------------------------------------
 
             if not codes_to_predict:
                 continue
 
-            # 3. 批处理预测 (提高效率)
+            # 批量预测
             candidate_strings = [item[1] for item in codes_to_predict]
             batch_probs, batch_preds = self.model_zoo.batch_predict(candidate_strings, self.target_model)
 
             best_var_fitness = float('-inf')
-            best_var_sub = None
             best_var_code = None
             best_var_probs = None
             best_var_pred = None
 
             for i in range(len(codes_to_predict)):
-                cand_name = codes_to_predict[i][0]
                 probs = batch_probs[i]
                 pred = batch_preds[i]
 
-                # 计算 Fitness (沿用你遗传算法中的 Log-Odds 逻辑)
                 orig_prob = max(probs[original_pred], 1e-9)
                 if len(probs) == 2:
                     target_prob = max(probs[1 - original_pred], 1e-9)
@@ -217,17 +214,13 @@ class GreedyOptimizer:
 
                 fitness = math.log(target_prob) - math.log(orig_prob)
 
-                # 寻找当前变量下的最优替换
                 if fitness > best_var_fitness:
                     best_var_fitness = fitness
-                    best_var_sub = cand_name
                     best_var_code = candidate_strings[i]
                     best_var_probs = probs
                     best_var_pred = pred
 
-            # 4. 更新当前代码 (贪心选择)
-            # 如果找到了能让模型更困惑的替换，则保留该修改
-            if best_var_fitness > float('-inf'):
+            if best_var_code and best_var_fitness > float('-inf'):
                 current_code = best_var_code
                 current_best_probs = best_var_probs
                 current_best_pred = best_var_pred
@@ -236,9 +229,7 @@ class GreedyOptimizer:
                     overall_best_fitness = best_var_fitness
                     overall_best_code = best_var_code
 
-                # =================== [提前退出逻辑] ===================
                 if current_best_pred != original_pred and self.run_mode == "attack":
                     return True, current_code, current_best_probs, current_best_pred
-                # =====================================================
 
         return (current_best_pred != original_pred), overall_best_code, current_best_probs, current_best_pred
