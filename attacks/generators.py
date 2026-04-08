@@ -13,6 +13,7 @@ class CodeBasedCandidateGenerator:
     def __init__(self, model_zoo, analyzer):
         self.model_zoo = model_zoo
         self.analyzer = analyzer
+        self.common_affixes = ['ptr', 'buf', 'val', 'idx', 'msg', 'data', 'tmp', 'ref', 'res', 'list', 'obj', 'item', 'ctx']
 
     def _detect_naming_style(self, name: str) -> str:
         if '_' in name:
