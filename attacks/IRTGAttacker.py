@@ -9,7 +9,7 @@ from utils.model_zoo import ModelZoo
 class IRTGAttacker:
     # 2. 在 __init__ 中增加 optimizer_type 参数，默认为 "ga"
     def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, top_k=5, mode="binary",
-                 iterations=10, run_mode="attack", optimizer_type="ga"):
+                 iterations=10, run_mode="attack", optimizer_type="greedy"):
         self.model_zoo = model_zoo
         self.model_names = model_zoo.model_names
         self.top_k = top_k
@@ -60,6 +60,7 @@ class IRTGAttacker:
 
             raw_variables = self.attacker_params["get_all_vars_fn"](code)
             variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
+            print("Candidate Generating\n")
             subs_pool = self.attacker_params["get_subs_pool_fn"](code, variables)
             for var in list(subs_pool.keys()):
                 if not subs_pool[var]:
@@ -80,6 +81,7 @@ class IRTGAttacker:
                     f"\n[Sample {idx + 1}] Target={atk_model} | Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)...")
                 stats[atk_model][atk_model]["total"] += 1
 
+                print("RNNS-Start\n")
                 ranked_vars, all_scores = rankers[atk_model].rank_variables(
                     code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred,
                     top_k=max(self.top_k, int(len(variables) * 0.3))
@@ -88,6 +90,7 @@ class IRTGAttacker:
                 target_scores = {var: all_scores[var] for var in target_vars}
 
                 # 5. 调用统一命名的 optimizers 字典
+                print("GA-Start\n")
                 is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(
                     code=code, original_pred=orig_pred, target_vars=target_vars,
                     subs_pool=subs_pool, variable_scores=target_scores

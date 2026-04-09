@@ -14,9 +14,6 @@ class CodeBasedCandidateGenerator:
         self.model_zoo = model_zoo
         self.analyzer = analyzer
 
-    # ==========================================
-    # 通用辅助函数区 (模式一与模式二共享)
-    # ==========================================
     def _detect_naming_style(self, name: str) -> str:
         if '_' in name:
             return 'SCREAMING_SNAKE' if name.isupper() else 'snake_case'
@@ -57,6 +54,7 @@ class CodeBasedCandidateGenerator:
 
     def _build_masked_string(self, parts: List[str], start: int, end: int, num_masks: int, style: str, mask_token: str,
                              target_name: str) -> str:
+        """根据跨度和指定的 Mask 数量构造带 Mask 的变量名"""
         mask_list = [mask_token] * num_masks
         new_parts = parts[:start] + mask_list + parts[end:]
 
@@ -75,7 +73,9 @@ class CodeBasedCandidateGenerator:
 
     def _assemble_multi_candidate(self, parts: List[str], start: int, end: int, predicted_words: tuple, style: str,
                                   target_name: str) -> str:
+        """将预测出的多个词元与原词的剩余部分重新组装"""
         new_parts = parts[:start] + list(predicted_words) + parts[end:]
+
         if style == '_':
             return "_".join(new_parts)
         elif style == 'camel':
@@ -86,328 +86,186 @@ class CodeBasedCandidateGenerator:
         else:
             return "".join(predicted_words)
 
-    # ==========================================
-    # 模式一：语义变异生成 (允许长度变化、词数压缩)
-    # ==========================================
-    def generate_candidates(self, code: str, target_name: str, identifiers=None,
-                            top_k_mlm=80, top_n_keep=50,
-                            preserve_style: bool = True,
-                            semantic_threshold: float = 0.2,
-                            context_ratio: float = 0.3) -> List[str]:
-        """
-        新增参数:
-        context_ratio (float): [0.0, 1.0] 之间，指定有多少比例的候选词是完全脱离原变量名（即全掩码）生成的。
-        """
-        keywords = self.analyzer.keywords
-        code_bytes = code.encode("utf-8")
+    def _get_model_logits(self, prefix: bytes, masked_var_name_bytes: bytes, suffix: bytes):
+        """提取的公共组件 1：处理截断、分词和模型推理"""
+        masked_code_bytes = prefix + masked_var_name_bytes + suffix
+        mask_start = len(prefix)
+        mask_end = mask_start + len(masked_var_name_bytes)
+        context_half = 700
 
-        if identifiers is None:
-            identifiers = self.analyzer.extract_identifiers(code_bytes)
+        crop_start = max(0, mask_start - context_half)
+        crop_end = min(len(masked_code_bytes), mask_end + context_half)
+        cropped_code = masked_code_bytes[crop_start:crop_end].decode("utf-8", errors="replace")
 
-        if target_name not in identifiers:
-            return []
+        inputs = self.model_zoo.mlm_tokenizer(
+            cropped_code, return_tensors="pt", truncation=True, max_length=512
+        ).to(self.model_zoo.device)
 
-        original_style = self._detect_naming_style(target_name)
-        original_emb = None
-        if semantic_threshold > 0:
-            original_emb = self._get_word_embedding(target_name)
+        mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
+        mask_indices = (inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
 
-        target_info = identifiers[target_name][0]
-        start_byte = target_info['start']
-        end_byte = target_info['end']
-        prefix = code_bytes[:start_byte]
-        suffix = code_bytes[end_byte:]
+        if len(mask_indices) == 0:
+            return None, []
 
-        parts, style = self._split_identifier(target_name)
-        mask_token = self.model_zoo.mlm_tokenizer.mask_token
+        with torch.no_grad():
+            logits = self.model_zoo.mlm_model(**inputs).logits
 
-        # 1. 构建所有掩码变体 (Topology Variations)
-        variations = []
-        n_parts = len(parts)
+        return logits, mask_indices
 
-        # A. 全掩码 (完全依赖上下文)
-        variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1})
-        if n_parts > 1:
-            # 用同等数量的 Mask 替换全身，联合预测全新的长变量
-            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
-
-        # B. 局部跨度掩码 (Sub-span Masking)
-        if n_parts > 1:
-            for start in range(n_parts):
-                for end in range(start + 1, n_parts + 1):
-                    if start == 0 and end == n_parts:
-                        continue  # 已经是全掩码了
-
-                    span_len = end - start
-                    # 变体 1: 将这段跨度压缩为 1 个 Mask (例如 3词 变 1词)
-                    variations.append({'type': 'sub', 'start': start, 'end': end, 'num_masks': 1})
-
-                    # 变体 2: 等长替换 (例如 3词 换 3词)
-                    if span_len > 1:
-                        variations.append({'type': 'sub', 'start': start, 'end': end, 'num_masks': span_len})
-
-        raw_full_cands = []
-        raw_sub_cands_lists = []  # 用于子集变体的交替收集
-
-        # 2. 执行模型预测
-        for var in variations:
-            masked_var_name = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style,
-                                                        mask_token, target_name)
-            masked_code_bytes = prefix + masked_var_name.encode("utf-8") + suffix
-
-            mask_start_in_masked = len(prefix)
-            mask_end_in_masked = mask_start_in_masked + len(masked_var_name.encode("utf-8"))
-            context_half_size = 700
-
-            crop_start = max(0, mask_start_in_masked - context_half_size)
-            crop_end = min(len(masked_code_bytes), mask_end_in_masked + context_half_size)
-            cropped_code = masked_code_bytes[crop_start:crop_end].decode("utf-8", errors="replace")
-
-            inputs = self.model_zoo.mlm_tokenizer(
-                cropped_code, return_tensors="pt", truncation=True, max_length=512
-            ).to(self.model_zoo.device)
-
-            mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
-            mask_indices = (inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
-
-            if len(mask_indices) < var['num_masks']:
-                continue
-
-            with torch.no_grad():
-                logits = self.model_zoo.mlm_model(**inputs).logits
-
-                # 如果只有一个 MASK
-                if var['num_masks'] == 1:
-                    mask_logits = logits[0, mask_indices[0], :]
-                    _, top_k_indices = torch.topk(mask_logits, top_k_mlm, dim=-1)
-
-                    current_cands = []
-                    for idx in top_k_indices:
-                        pred_word = self.model_zoo.mlm_tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##',
-                                                                                                                '')
-                        pred_word = re.sub(r'[^a-zA-Z0-9_]', '', pred_word)
-                        if not pred_word or (not pred_word[0].isalpha() and pred_word[0] != '_'):
-                            continue
-
-                        full_cand = self._assemble_multi_candidate(parts, var['start'], var['end'], (pred_word,), style,
-                                                                   target_name)
-                        current_cands.append(full_cand)
-
-                # 如果有多个 MASK (联合预测)
-                else:
-                    per_mask_top_k = min(10, max(3, top_k_mlm // (var['num_masks'] * 2)))  # 限制多词组合防爆炸
-                    mask_preds = []
-
-                    for m_idx in range(var['num_masks']):
-                        m_logits = logits[0, mask_indices[m_idx], :]
-                        _, top_indices = torch.topk(m_logits, per_mask_top_k, dim=-1)
-
-                        words = []
-                        for idx in top_indices:
-                            w = self.model_zoo.mlm_tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##', '')
-                            w = re.sub(r'[^a-zA-Z0-9]', '', w)  # 多词联合中间不能带下划线
-                            if w: words.append(w)
-                        mask_preds.append(words if words else ['temp'])
-
-                    # 笛卡尔积产生联合组合 (例如 top 5 x top 5 x top 5 = 125 种可能)
-                    current_cands = []
-                    for combo in itertools.product(*mask_preds):
-                        full_cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style,
-                                                                   target_name)
-                        current_cands.append(full_cand)
-
-            if var['type'] == 'full':
-                raw_full_cands.extend(current_cands)
+    def _decode_words(self, mask_logits, top_k, allow_underscore=False, required_length=None):
+        """提取的公共组件 2：解码 Token 并执行硬性长度与字符过滤"""
+        _, top_indices = torch.topk(mask_logits, top_k, dim=-1)
+        words = []
+        for idx in top_indices:
+            w = self.model_zoo.mlm_tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##', '')
+            if allow_underscore:
+                w = re.sub(r'[^a-zA-Z0-9_]', '', w)
+                if not w or (not w[0].isalpha() and w[0] != '_'): continue
             else:
-                raw_sub_cands_lists.append(current_cands)
+                w = re.sub(r'[^a-zA-Z0-9]', '', w)
+                if not w: continue
 
-        # 3. 收集与整理
-        # (1) 去重纯上下文生成词
-        unique_full = list(dict.fromkeys(raw_full_cands))
+            if required_length is not None and len(w) != required_length:
+                continue
+            words.append(w)
+        return words
 
-        # (2) 交替收集局部替换词，保证多样性
-        unique_sub = []
-        seen_sub = set()
-        if raw_sub_cands_lists:
-            max_len = max(len(lst) for lst in raw_sub_cands_lists)
-            for j in range(max_len):
-                for lst in raw_sub_cands_lists:
-                    if j < len(lst) and lst[j] not in seen_sub:
-                        seen_sub.add(lst[j])
-                        unique_sub.append(lst[j])
+    def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
+        """提取的公共组件 3：统一的语义和 AST 验证通道"""
+        added = 0
+        for cand in candidate_list:
+            if added >= quota: break
+            if cand in ctx['keywords'] or cand == ctx['target_name']: continue
+            if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
 
-        # 4. 配额分配与最终过滤
-        target_full_quota = int(top_n_keep * context_ratio)
-        target_sub_quota = top_n_keep - target_full_quota
+            # 语义校验 (全掩码猜测可跳过)
+            if not is_full_context and ctx['semantic_threshold'] > 0 and ctx['original_emb'] is not None:
+                cand_emb = self._get_word_embedding(cand)
+                if cand_emb is not None:
+                    sim = F.cosine_similarity(ctx['original_emb'].unsqueeze(0), cand_emb.unsqueeze(0)).item()
+                    if sim < ctx['semantic_threshold']: continue
 
-        final_candidates = []
-
-        # Modified _filter_and_add
-        def _filter_and_add(candidate_list, quota, is_full_context=False):
-            added_count = 0
-            for cand in candidate_list:
-                if added_count >= quota:
-                    break
-                if cand in keywords or cand == target_name: continue
-                if preserve_style and not self._matches_style(original_style, cand): continue
-
-                # CRITICAL FIX 1: Bypass semantic check if it's a full context guess
-                if not is_full_context and semantic_threshold > 0 and original_emb is not None:
-                    cand_emb = self._get_word_embedding(cand)
-                    if cand_emb is not None:
-                        sim = F.cosine_similarity(original_emb.unsqueeze(0), cand_emb.unsqueeze(0)).item()
-                        if sim < semantic_threshold: continue
-
-                if not self.analyzer.can_rename_to(code_bytes, target_name, cand): continue
-                try:
-                    _ = CodeTransformer.validate_and_apply(code_bytes, identifiers, {target_name: cand},
-                                                           analyzer=self.analyzer)
+            # AST 物理冲突校验
+            if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand): continue
+            try:
+                CodeTransformer.validate_and_apply(ctx['code_bytes'], ctx['identifiers'],
+                                                   {ctx['target_name']: cand}, analyzer=self.analyzer)
+                if cand not in final_candidates:
                     final_candidates.append(cand)
-                    added_count += 1
-                except Exception:
-                    continue
-            return added_count
+                    added += 1
+            except Exception:
+                continue
+        return added
 
-        # 优先填满 Full Context 词汇
-        actual_full_added = _filter_and_add(unique_full, target_full_quota, is_full_context=True)
+    def _generate_core(self, code: str, target_name: str, identifiers: dict,
+                       top_k_mlm: int, top_n_keep: int, semantic_threshold: float,
+                       context_ratio: float, preserve_style: bool, strict_structure: bool) -> List[str]:
+        """合并后的核心生成流水线"""
 
-        # 如果 Full Context 没填满配额，把名额让给 Sub Mask
-        remaining_quota = top_n_keep - actual_full_added
-        _filter_and_add(unique_sub, remaining_quota, is_full_context=False)
-        # 最后去重返回
-        unique_final = list(dict.fromkeys(final_candidates))
+        # ==========================================
+        # 新增优化：前置拦截低价值/不合法的变量名
+        # ==========================================
+        # 1. 过滤单字母变量 (忽略前后下划线后的核心长度，例如 '_x' 也会被过滤)
+        if len(target_name.strip('_')) <= 1:
+            return []
 
-        if len(unique_final) > top_n_keep:
-            return random.sample(unique_final, top_n_keep)
-        return unique_final
+        # 2. 过滤 Python 内置的魔法方法/系统级变量 (如 __init__, __dict__)
+        if target_name.startswith('__') and target_name.endswith('__'):
+            return []
 
-
-    # 模式二：同构生成 (完美复用高级逻辑，增加长度强制约束)
-    # ==========================================
-    def generate_structural_candidates(self, code: str, target_name: str, identifiers=None,
-                                       top_k_mlm=100, top_n_keep=20,
-                                       semantic_threshold: float = 0.5,
-                                       context_ratio: float = 0.3) -> List[str]:
-        """
-        基于上下文和语意的同构生成：
-        生成的变量名与原变量名词块数量完全一致，且对应的每一个词块长度完全相等。
-        """
-        keywords = self.analyzer.keywords
         code_bytes = code.encode("utf-8")
-
         if identifiers is None:
             identifiers = self.analyzer.extract_identifiers(code_bytes)
 
-        if target_name not in identifiers:
-            return []
+        if target_name not in identifiers: return []
 
         original_style = self._detect_naming_style(target_name)
-        original_emb = None
-        if semantic_threshold > 0:
-            original_emb = self._get_word_embedding(target_name)
+        original_emb = self._get_word_embedding(target_name) if semantic_threshold > 0 else None
 
         target_info = identifiers[target_name][0]
-        start_byte = target_info['start']
-        end_byte = target_info['end']
-        prefix = code_bytes[:start_byte]
-        suffix = code_bytes[end_byte:]
+        prefix = code_bytes[:target_info['start']]
+        suffix = code_bytes[target_info['end']:]
 
         parts, style = self._split_identifier(target_name)
-        mask_token = self.model_zoo.mlm_tokenizer.mask_token
-
-        # 【核心差异 1：获取每个部位的绝对长度限制】
-        target_lengths = [len(p) for p in parts]
         n_parts = len(parts)
 
-        # 1. 构建掩码变体 (严格同构：禁绝压缩，1个词换1个词)
+        # 3. 过滤超长变量名：如果词块数量过多（比如超过10个词拼接），MLM联合猜测极易引发组合爆炸，直接拦截
+        if n_parts > 10:
+            return []
+
+        target_lengths = [len(p) for p in parts]
+        mask_token = self.model_zoo.mlm_tokenizer.mask_token
+
+        # 1. 动态构建掩码变体 (Strategy Pattern)
         variations = []
+        if strict_structure:
+            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
+            if n_parts > 1:
+                for s in range(n_parts):
+                    for e in range(s + 1, n_parts + 1):
+                        if s == 0 and e == n_parts: continue
+                        variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
+        else:
+            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1})
+            if n_parts > 1:
+                variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
+                for s in range(n_parts):
+                    for e in range(s + 1, n_parts + 1):
+                        if s == 0 and e == n_parts: continue
+                        variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': 1})
+                        if (e - s) > 1:
+                            variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
 
-        # A. 全部位掩码替换
-        variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
-
-        # B. 局部跨度掩码替换
-        if n_parts > 1:
-            for start in range(n_parts):
-                for end in range(start + 1, n_parts + 1):
-                    if start == 0 and end == n_parts:
-                        continue
-                    span_len = end - start
-                    # 【核心差异 2：禁止压缩，掩码数量必须等于被替换的跨度词数】
-                    variations.append({'type': 'sub', 'start': start, 'end': end, 'num_masks': span_len})
-
-        raw_full_cands = []
-        raw_sub_cands_lists = []
-
-        # 2. 执行模型预测
+        # 2. 执行模型预测与解码
+        raw_full_cands, raw_sub_cands_lists = [], []
         for var in variations:
-            masked_var_name = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style,
-                                                        mask_token, target_name)
-            masked_code_bytes = prefix + masked_var_name.encode("utf-8") + suffix
+            masked_var = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style, mask_token,
+                                                   target_name)
+            logits, mask_indices = self._get_model_logits(prefix, masked_var.encode("utf-8"), suffix)
 
-            mask_start_in_masked = len(prefix)
-            mask_end_in_masked = mask_start_in_masked + len(masked_var_name.encode("utf-8"))
-            context_half_size = 700
+            if logits is None or len(mask_indices) < var['num_masks']: continue
 
-            crop_start = max(0, mask_start_in_masked - context_half_size)
-            crop_end = min(len(masked_code_bytes), mask_end_in_masked + context_half_size)
-            cropped_code = masked_code_bytes[crop_start:crop_end].decode("utf-8", errors="replace")
-
-            inputs = self.model_zoo.mlm_tokenizer(
-                cropped_code, return_tensors="pt", truncation=True, max_length=512
-            ).to(self.model_zoo.device)
-
-            mask_indices = (inputs.input_ids[0] == self.model_zoo.mlm_tokenizer.mask_token_id).nonzero(as_tuple=True)[0]
-            if len(mask_indices) < var['num_masks']:
-                continue
-
-            with torch.no_grad():
-                logits = self.model_zoo.mlm_model(**inputs).logits
-
-                # 因为要做严格的长度过滤，我们需要把原始的 Top-K 放大，避免漏网之鱼
-                expanded_top_k = top_k_mlm * 5
+            current_cands = []
+            if var['num_masks'] == 1 and not strict_structure:
+                words = self._decode_words(logits[0, mask_indices[0], :], top_k_mlm, allow_underscore=True)
+                for w in words:
+                    current_cands.append(
+                        self._assemble_multi_candidate(parts, var['start'], var['end'], (w,), style, target_name))
+            else:
                 per_mask_top_k = min(10, max(3, top_k_mlm // (var['num_masks'] * 2)))
+                expanded_top_k = top_k_mlm * 5 if strict_structure else per_mask_top_k
                 mask_preds = []
 
                 for m_idx in range(var['num_masks']):
-                    part_index = var['start'] + m_idx  # 对应原词的哪个块
-                    required_length = target_lengths[part_index]  # 该块要求的绝对长度
+                    part_idx = var['start'] + m_idx if strict_structure else None
+                    req_len = target_lengths[part_idx] if strict_structure else None
 
-                    m_logits = logits[0, mask_indices[m_idx], :]
-                    _, top_indices = torch.topk(m_logits, expanded_top_k, dim=-1)
+                    words = self._decode_words(logits[0, mask_indices[m_idx], :], expanded_top_k,
+                                               allow_underscore=False, required_length=req_len)
+                    words = words[:per_mask_top_k]  # 截断回正常阈值
 
-                    words = []
-                    for idx in top_indices:
-                        w = self.model_zoo.mlm_tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##', '')
-                        w = re.sub(r'[^a-zA-Z0-9]', '', w)
-
-                        # 【核心差异 3：绝对长度拦截器】
-                        if len(w) == required_length:
-                            words.append(w)
-                        if len(words) >= per_mask_top_k:
-                            break
-
-                    # 【核心差异 4：退化保护机制】
-                    # 如果大模型实在猜不出这个长度的词，我们强制保留该部位的原词，确切保证结构不崩塌
-                    if not words:
-                        words = [parts[part_index]]
-
+                    # 退化保护机制
+                    if strict_structure and not words:
+                        words = [parts[part_idx]]
+                    elif not strict_structure and not words:
+                        words = ['temp']
                     mask_preds.append(words)
 
-                # 笛卡尔积组装
-                current_cands = []
+                # 笛卡尔积产生联合组合
                 for combo in itertools.product(*mask_preds):
-                    full_cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style,
-                                                               target_name)
-                    # 二次核对一下长度是否真的完全同构（防卫性编程）
-                    if [len(p) for p in self._split_identifier(full_cand)[0]] == target_lengths:
-                        current_cands.append(full_cand)
+                    cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style, target_name)
+                    if strict_structure:
+                        if [len(p) for p in self._split_identifier(cand)[0]] == target_lengths:
+                            current_cands.append(cand)
+                    else:
+                        current_cands.append(cand)
 
             if var['type'] == 'full':
                 raw_full_cands.extend(current_cands)
             else:
                 raw_sub_cands_lists.append(current_cands)
 
-        # 3. 收集与整理 (与模式一完全复用的逻辑)
+        # 3. 收集与整理去重
         unique_full = list(dict.fromkeys(raw_full_cands))
         unique_sub = []
         seen_sub = set()
@@ -419,54 +277,51 @@ class CodeBasedCandidateGenerator:
                         seen_sub.add(lst[j])
                         unique_sub.append(lst[j])
 
-        # 4. 配额分配与最终过滤 (严格执行 AST 与 语义校验)
-        target_full_quota = int(top_n_keep * context_ratio)
-        target_sub_quota = top_n_keep - target_full_quota
-
+        # 4. AST与语意过滤
+        ctx = {
+            'code_bytes': code_bytes, 'target_name': target_name, 'identifiers': identifiers,
+            'keywords': self.analyzer.keywords, 'original_style': original_style,
+            'original_emb': original_emb, 'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style
+        }
         final_candidates = []
+        target_full_quota = int(top_n_keep * context_ratio)
 
-        def _filter_and_add(candidate_list, quota):
-            added_count = 0
-            for cand in candidate_list:
-                if added_count >= quota:
-                    break
-                if cand in keywords or cand == target_name: continue
-                # 同构生成必须风格一致
-                if not self._matches_style(original_style, cand): continue
+        actual_full = self._verify_and_filter(unique_full, target_full_quota, final_candidates, ctx,
+                                              is_full_context=True)
+        self._verify_and_filter(unique_sub, top_n_keep - actual_full, final_candidates, ctx, is_full_context=False)
 
-                # 张量级语义校验 (复用)
-                if semantic_threshold > 0 and original_emb is not None:
-                    cand_emb = self._get_word_embedding(cand)
-                    if cand_emb is not None:
-                        sim = F.cosine_similarity(original_emb.unsqueeze(0), cand_emb.unsqueeze(0)).item()
-                        if sim < semantic_threshold: continue
-
-                # AST 物理冲突校验 (复用)
-                if not self.analyzer.can_rename_to(code_bytes, target_name, cand): continue
-                try:
-                    _ = CodeTransformer.validate_and_apply(code_bytes, identifiers, {target_name: cand},
-                                                           analyzer=self.analyzer)
-                    final_candidates.append(cand)
-                    added_count += 1
-                except Exception:
-                    continue
-            return added_count
-
-        actual_full_added = _filter_and_add(unique_full, target_full_quota)
-        remaining_quota = top_n_keep - actual_full_added
-        _filter_and_add(unique_sub, remaining_quota)
-
-        # 降级预案：如果通过模型预测的同构词由于过滤条件太严不够数，补充原有的本地拼接逻辑
-        if len(final_candidates) < top_n_keep:
+        # 5. 模式特有兜底 (降级预案)
+        if strict_structure and len(final_candidates) < top_n_keep:
             local_cands = self._generate_structural_fallback(code_bytes, target_name, identifiers,
                                                              top_n_keep - len(final_candidates))
             for lc in local_cands:
-                if lc not in final_candidates:
-                    # 本地降级生成的也过一遍检查
-                    if self.analyzer.can_rename_to(code_bytes, target_name, lc):
-                        final_candidates.append(lc)
+                if lc not in final_candidates and self.analyzer.can_rename_to(code_bytes, target_name, lc):
+                    final_candidates.append(lc)
 
-        return list(dict.fromkeys(final_candidates))
+        if len(final_candidates) > top_n_keep:
+            return random.sample(final_candidates, top_n_keep)
+        return final_candidates
+
+    # ==========================================
+    # 极度精简后的公共 API 接口
+    # ==========================================
+    def generate_candidates(self, code: str, target_name: str, identifiers=None,
+                            top_k_mlm=60, top_n_keep=50, preserve_style: bool = True,
+                            semantic_threshold: float = 0.2, context_ratio: float = 0.3) -> List[str]:
+        """模式一：普通生成"""
+        return self._generate_core(
+            code, target_name, identifiers, top_k_mlm, top_n_keep,
+            semantic_threshold, context_ratio, preserve_style, strict_structure=False
+        )
+
+    def generate_structural_candidates(self, code: str, target_name: str, identifiers=None,
+                                       top_k_mlm=60, top_n_keep=50,
+                                       semantic_threshold: float = 0.5, context_ratio: float = 0.3) -> List[str]:
+        """模式二：同构生成（强制一致性风格与严格结构）"""
+        return self._generate_core(
+            code, target_name, identifiers, top_k_mlm, top_n_keep,
+            semantic_threshold, context_ratio, preserve_style=True, strict_structure=True
+        )
 
     # ==========================================
     # 模式二：降级保护兜底 (原始结构拼接逻辑)

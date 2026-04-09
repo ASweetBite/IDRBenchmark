@@ -17,8 +17,8 @@ def main(args):
     # 1. 初始化核心组件
     model_configs = {
         "CodeBERT": "./models/binary_diversevul_codebert" if args.mode == "binary" else "./models/multi_diversevul_codebert",
-        "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
-        "UniXcoder": "./models/binary_diversevul_unixcoder",
+        # "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
+        # "UniXcoder": "./models/binary_diversevul_unixcoder",
     }
 
     # 确保模型路径存在
@@ -42,7 +42,7 @@ def main(args):
         code_bytes = code_str.encode("utf-8")
         identifiers = analyzer.extract_identifiers(code_bytes)
         for var in variables:
-            pool[var] = generator.generate_candidates(code_str, var, identifiers=identifiers)
+            pool[var] = generator.generate_structural_candidates(code_str, var, identifiers=identifiers)
         return pool
 
     def rename_fn(code_str: str, renaming_map: dict) -> str:
@@ -58,7 +58,8 @@ def main(args):
         get_subs_pool_fn=get_subs_pool_fn,
         rename_fn=rename_fn,
         mode=args.mode,  # 告知攻击者当前是二分类还是多分类，用于定义攻击成功逻辑
-        iterations=args.iterations  # 告知遗传算法迭代次数
+        iterations=args.iterations,  # 告知遗传算法迭代次数
+        optimizer_type=args.algorithm
     )
 
     # 4. 加载数据 (使用修改后的 loader)
@@ -70,7 +71,6 @@ def main(args):
     asr_matrix_vrtg = evaluator.attack(dataset)
     normalier = NormalizationAttacker(
         model_zoo=model_zoo,
-        get_all_vars_fn=get_all_identifiers_fn,
         rename_fn=rename_fn,
         mode=args.mode
     )
@@ -154,7 +154,8 @@ if __name__ == "__main__":
                         help="数据集路径 (parquet文件)")
     parser.add_argument("--iterations", type=int, default=20,
                         help="遗传算法迭代次数")
-
+    parser.add_argument("--algorithm", type=str, choices=["ga","greedy"], default="ga",
+                        help="使用什么优化算法")
     args = parser.parse_args()
 
     # 设置随机种子
