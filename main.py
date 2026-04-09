@@ -1,36 +1,54 @@
-import random
-import torch
-import numpy as np
 import argparse
-import os
+import random
 
+import numpy as np
+import torch
+
+from attacks.IRTGAttacker import IRTGAttacker
+from attacks.LightweightCandidateGenerator import LightweightCandidateGenerator
 from attacks.NormalizationAttacker import NormalizationAttacker
 from attacks.RandomAttacker import RandomAttacker
+from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
-from utils.model_zoo import ModelZoo
 from utils.dataset import DatasetLoader
-from attacks.generators import CodeBasedCandidateGenerator
-from attacks.IRTGAttacker import IRTGAttacker
+from utils.mlm_engine import MLMEngine
+from utils.model_zoo import ModelZoo, CodeSmoother
 
 
 def main(args):
     # 1. 初始化核心组件
-    model_configs = {
-        "CodeBERT": "./models/binary_diversevul_codebert" if args.mode == "binary" else "./models/multi_diversevul_codebert",
-        # "GraphCodeBERT": "./models/binary_diversevul_graphcodebert",
-        # "UniXcoder": "./models/binary_diversevul_unixcoder",
+    analyzer = IdentifierAnalyzer(lang="cpp")
+    mlm_engine = MLMEngine("microsoft/codebert-base-mlm")
+    light_cand_config = {
+        "candidate": {
+            "top_m": 15,
+            "fasttext_model_path": "./models/fasttext_cpp.bin",
+            "faiss_index_path": "./models/faiss_cpp.index",
+            "faiss_vocab_path": "./models/vocab_cpp.json"
+        }
     }
+    lightweight_generator = LightweightCandidateGenerator(light_cand_config)
+    # 2. 中间层：初始化候选词生成器 (依赖 MLM)
+    generator = HeavyWeightCandidateGenerator(mlm_engine, analyzer)
 
-    # 确保模型路径存在
-    for name, path in model_configs.items():
-        if not os.path.exists(path):
-            print(f"[!] 模型路径不存在: {path}")
-            return
-
-    model_zoo = ModelZoo(model_configs)
-    analyzer = IdentifierAnalyzer(lang="cpp")  # 假设初始化支持语言指定
+    # 3. 防御层：初始化平滑器 (依赖生成器)
+    smoother_cfg = {
+        "num_samples": 50,
+        "variance_threshold": 0.05,
+        "replace_prob": 0.5,
+        "batch_size": 32
+    }
+    smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
+    # 4. 顶层：初始化 ModelZoo (依赖平滑器)，传入被攻击的靶标模型
+    model_configs = {
+        "CodeBERT": "./models/finetuned_model_codebert"
+    }
+    model_zoo = ModelZoo(
+        model_configs=model_configs,
+        eval_mode=args.mode,
+        smoother=smoother  # 完美注入，没有循环依赖
+    )
     transformer = CodeTransformer()
-    generator = CodeBasedCandidateGenerator(model_zoo, analyzer)
 
     # 2. 定义回调函数
     def get_all_identifiers_fn(code_str: str) -> list:

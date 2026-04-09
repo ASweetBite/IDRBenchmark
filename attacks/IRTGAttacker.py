@@ -73,8 +73,8 @@ class IRTGAttacker:
             for atk_model in self.model_names:
                 orig_pred = orig_predictions[atk_model]["pred"]
 
-                if orig_pred != ground_truth:
-                    continue
+                # if orig_pred != ground_truth:
+                #     continue
 
                 # 4. 打印当前使用的模式
                 print(

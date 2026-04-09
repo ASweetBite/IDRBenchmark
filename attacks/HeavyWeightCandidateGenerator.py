@@ -1,17 +1,18 @@
-import re
-import random
-import torch
 import itertools
-from typing import List, Dict
-import torch.nn.functional as F
+import random
+import re
 from collections import defaultdict
+from typing import List, Any
 
-from utils.ast_tools import IdentifierAnalyzer, is_valid_identifier, CodeTransformer
+import torch
+import torch.nn.functional as F
+
+from utils.ast_tools import CodeTransformer
 
 
-class CodeBasedCandidateGenerator:
-    def __init__(self, model_zoo, analyzer):
-        self.model_zoo = model_zoo
+class HeavyWeightCandidateGenerator:
+    def __init__(self, mlm_engine, analyzer):
+        self.mlm_engine = mlm_engine
         self.analyzer = analyzer
 
     def _detect_naming_style(self, name: str) -> str:
@@ -33,14 +34,14 @@ class CodeBasedCandidateGenerator:
             return True
         return cand_style == original_style
 
-    def _get_word_embedding(self, word: str) -> torch.Tensor:
-        tokenizer = self.model_zoo.mlm_tokenizer
+    def _get_word_embedding(self, word: str) -> Any | None:
+        tokenizer = self.mlm_engine.tokenizer
         tokens = tokenizer(word, add_special_tokens=False, return_tensors="pt").input_ids[0]
         if len(tokens) == 0:
             return None
-        tokens = tokens.to(self.model_zoo.device)
+        tokens = tokens.to(self.mlm_engine.device)
         with torch.no_grad():
-            embeddings = self.model_zoo.mlm_model.get_input_embeddings()(tokens)
+            embeddings = self.mlm_engine.model.get_input_embeddings()(tokens)
         return embeddings.mean(dim=0)
 
     def _split_identifier(self, name: str):
@@ -97,18 +98,18 @@ class CodeBasedCandidateGenerator:
         crop_end = min(len(masked_code_bytes), mask_end + context_half)
         cropped_code = masked_code_bytes[crop_start:crop_end].decode("utf-8", errors="replace")
 
-        inputs = self.model_zoo.mlm_tokenizer(
+        inputs = self.mlm_engine.tokenizer(
             cropped_code, return_tensors="pt", truncation=True, max_length=512
-        ).to(self.model_zoo.device)
+        ).to(self.mlm_engine.device)
 
-        mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
+        mask_token_id = self.mlm_engine.tokenizer.mask_token_id
         mask_indices = (inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
 
         if len(mask_indices) == 0:
             return None, []
 
         with torch.no_grad():
-            logits = self.model_zoo.mlm_model(**inputs).logits
+            logits = self.mlm_engine.model(**inputs).logits
 
         return logits, mask_indices
 
@@ -117,7 +118,7 @@ class CodeBasedCandidateGenerator:
         _, top_indices = torch.topk(mask_logits, top_k, dim=-1)
         words = []
         for idx in top_indices:
-            w = self.model_zoo.mlm_tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##', '')
+            w = self.mlm_engine.tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##', '')
             if allow_underscore:
                 w = re.sub(r'[^a-zA-Z0-9_]', '', w)
                 if not w or (not w[0].isalpha() and w[0] != '_'): continue
@@ -194,7 +195,7 @@ class CodeBasedCandidateGenerator:
             return []
 
         target_lengths = [len(p) for p in parts]
-        mask_token = self.model_zoo.mlm_tokenizer.mask_token
+        mask_token = self.mlm_engine.tokenizer.mask_token
 
         # 1. 动态构建掩码变体 (Strategy Pattern)
         variations = []
