@@ -366,3 +366,152 @@ class HeavyWeightCandidateGenerator:
                     fallback_candidates.append(assembled)
 
         return list(dict.fromkeys(fallback_candidates))[:num_needed]
+
+    def get_top_mlm_words(self, code_bytes: bytes, target_name: str, top_k=20) -> List[str]:
+        """
+        通用的 MLM 单词预测逻辑：返回最适合 target_name 位置的原始单词列表
+        """
+        mask_token = self.model_zoo.mlm_tokenizer.mask_token
+        # 1. 掩码替换
+        pattern = rf'\b{re.escape(target_name)}\b'.encode()
+        masked_code_bytes = re.sub(pattern, mask_token.encode(), code_bytes, count=1)
+
+        # 2. 裁剪上下文 (参考你原有的逻辑)
+        # ... (此处省略部分裁剪逻辑，建议直接复用你 generate_candidates 里的截断代码)
+        inputs = self.model_zoo.mlm_tokenizer(
+            masked_code_bytes.decode(errors='replace'),
+            return_tensors="pt", truncation=True, max_length=512
+        ).to(self.model_zoo.device)
+
+        mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
+        mask_indices = (inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
+
+        if len(mask_indices) == 0: return []
+
+        with torch.no_grad():
+            logits = self.model_zoo.mlm_model(**inputs).logits
+            mask_logits = logits[0, mask_indices[0], :]
+            _, top_k_indices = torch.topk(mask_logits, top_k, dim=-1)
+
+        words = []
+        for idx in top_k_indices:
+            word = self.model_zoo.mlm_tokenizer.decode([idx]).strip().lower()
+            word = re.sub(r'[^a-z]', '', word)  # 只保留纯字母
+            if len(word) > 1:
+                words.append(word)
+        return words
+
+    def _infer_type_from_code(self, code: str, target_name: str) -> str:
+        """
+        增强版正则回溯：支持多变量声明、无空格指针等复杂 C/C++ 语法
+        """
+        # 匹配模式升级：
+        # 1. [\w\s\*,&:]*? 允许类型名中包含逗号(多变量)、&号(引用)、::(命名空间)
+        # 2. \s* 允许变量名前没有空格 (例如 int *var)
+        pattern = r'([a-zA-Z_][\w\s\*,&:]*?)\s*\b' + re.escape(target_name) + r'\b\s*[\[=;,)]'
+        match = re.search(pattern, code)
+
+        if match:
+            type_part = match.group(1).strip()
+
+            # --- 脏数据清洗 ---
+            # 如果匹配到了 "int a, b, "，我们只取逗号最前面的基础类型 "int a"
+            if ',' in type_part:
+                type_part = type_part.split(',')[0].strip()
+                # 去掉多余的变量名，比如 "int a" -> 变成 "int"
+                type_part = ' '.join([word for word in type_part.split() if word in
+                                      ["int", "long", "short", "char", "float", "double", "unsigned", "signed",
+                                       "struct", "class"]])
+
+            # 清理掉 static, const, inline 等修饰符
+            type_part = re.sub(r'\b(static|const|inline|extern|volatile|register)\b', '', type_part).strip()
+
+            # 如果清洗完不为空，返回类型
+            if type_part:
+                return type_part
+
+        # 函数参数定义兜底匹配 (int a, char *b)
+        param_pattern = r'([a-zA-Z_][\w\s\*,&:]*?)\s*\b' + re.escape(target_name) + r'\b\s*[,)]'
+        match = re.search(param_pattern, code)
+        if match:
+            type_part = match.group(1).strip()
+            type_part = re.sub(r'\b(const)\b', '', type_part).strip()
+            if type_part:
+                return type_part
+
+        # 如果实在找不到，返回 void
+        return "void"
+
+    def generate_normalized_name(self, code: str, target_name: str, var_type: str, excluded_names: set) -> str:
+        """
+        完全从 code 中推断类型并生成名字
+        支持规则：
+        1. 函数 -> fun_mask
+        2. 类实例 -> 类名_mask
+        3. 基础变量 -> int_mask / pointer_mask / char_mask
+        """
+
+        # --- 【新增规则】：判断是否为函数 ---
+        # 如果目标名字在代码中以 "名字(" 或 "名字 (" 的形式出现，则判定为函数
+        if re.search(r'\b' + re.escape(target_name) + r'\s*\(', code):
+            category = "fun"
+
+        else:
+            # --- 原有的变量推断逻辑 ---
+            inferred_type = self._infer_type_from_code(code, target_name)
+
+            # 1. 提取核心类型并清理修饰符
+            clean_type = re.sub(r'\b(struct|class|enum|union)\b', '', inferred_type).strip()
+            is_pointer = "*" in inferred_type or "*" in clean_type
+
+            # 提取最后一个词作为核心词
+            core_type = clean_type.replace("*", "").replace("&", "").strip()
+            core_type = core_type.split()[-1] if core_type else "void"
+
+            primitives_int = ["int", "long", "short", "size_t", "float", "double", "unsigned", "signed", "uint32_t",
+                              "uint64_t", "int32_t", "uint8_t"]
+            primitives_char = ["char"]
+
+            # 2. 确定类别前缀 (category)
+            if core_type == "void":
+                category = "var"
+            elif core_type.lower() not in (primitives_int + primitives_char + ["bool"]):
+                # 处理 C++ 命名空间
+                if "::" in core_type:
+                    category = core_type.split("::")[-1]
+                else:
+                    category = core_type
+
+                # 清洗非合法字符
+                category = re.sub(r'\W+', '', category)
+
+                # 数字防崩溃拦截
+                if not category or category.isdigit():
+                    category = "obj"
+                elif category[0].isdigit():
+                    category = "v" + category
+            else:
+                # 基础类型逻辑
+                if is_pointer:
+                    category = "pointer"
+                elif core_type.lower() in primitives_char:
+                    category = "char"
+                else:
+                    category = "int"
+
+        # --- 3. 获取 MLM 预测词并拼接 ---
+        code_str = code if isinstance(code, str) else code.decode('utf-8')
+        candidate_words = self.get_top_mlm_words(code_str.encode(), target_name)
+
+        # 4. 筛选一个未被使用的词
+        for w in candidate_words:
+            # 过滤掉非法的变量名字符
+            w = re.sub(r'\W+', '', w)
+            if not w: continue
+
+            potential_name = f"{category}_{w}"
+            if potential_name not in excluded_names:
+                return potential_name
+
+        # 5. 如果都冲突了，加数字后缀兜底
+        return f"{category}_{len(excluded_names)}"
