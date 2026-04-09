@@ -3,12 +3,12 @@ import re
 import json
 from typing import List, Dict, Tuple
 
-from attacks.generators import CodeBasedCandidateGenerator
+from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from utils.model_zoo import ModelZoo
 
 
 class NormalizationAttacker:
-    def __init__(self, model_zoo: ModelZoo, generator: CodeBasedCandidateGenerator,
+    def __init__(self, model_zoo: ModelZoo, generator: HeavyWeightCandidateGenerator,
                  get_all_vars_with_types_fn, rename_fn, mode="binary"):
         self.model_zoo = model_zoo
         self.generator = generator  # 现在持有一个支持 MLM 的生成器实例
