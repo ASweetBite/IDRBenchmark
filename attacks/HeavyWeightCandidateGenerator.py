@@ -371,31 +371,31 @@ class HeavyWeightCandidateGenerator:
         """
         通用的 MLM 单词预测逻辑：返回最适合 target_name 位置的原始单词列表
         """
-        mask_token = self.model_zoo.mlm_tokenizer.mask_token
+        mask_token = self.mlm_engine.tokenizer.mask_token
         # 1. 掩码替换
         pattern = rf'\b{re.escape(target_name)}\b'.encode()
         masked_code_bytes = re.sub(pattern, mask_token.encode(), code_bytes, count=1)
 
         # 2. 裁剪上下文 (参考你原有的逻辑)
         # ... (此处省略部分裁剪逻辑，建议直接复用你 generate_candidates 里的截断代码)
-        inputs = self.model_zoo.mlm_tokenizer(
+        inputs = self.mlm_engine.tokenizer(
             masked_code_bytes.decode(errors='replace'),
             return_tensors="pt", truncation=True, max_length=512
-        ).to(self.model_zoo.device)
+        ).to(self.mlm_engine.device)
 
-        mask_token_id = self.model_zoo.mlm_tokenizer.mask_token_id
+        mask_token_id = self.mlm_engine.tokenizer.mask_token_id
         mask_indices = (inputs.input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
 
         if len(mask_indices) == 0: return []
 
         with torch.no_grad():
-            logits = self.model_zoo.mlm_model(**inputs).logits
+            logits = self.mlm_engine.model(**inputs).logits
             mask_logits = logits[0, mask_indices[0], :]
             _, top_k_indices = torch.topk(mask_logits, top_k, dim=-1)
 
         words = []
         for idx in top_k_indices:
-            word = self.model_zoo.mlm_tokenizer.decode([idx]).strip().lower()
+            word = self.mlm_engine.tokenizer.decode([idx]).strip().lower()
             word = re.sub(r'[^a-z]', '', word)  # 只保留纯字母
             if len(word) > 1:
                 words.append(word)
