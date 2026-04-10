@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+import json # [新增]
 from typing import List, Dict, Optional
 from sklearn.preprocessing import LabelEncoder
 
@@ -11,12 +12,10 @@ class DatasetLoader:
         self.mode = "binary"  # 默认为二分类
 
     def load_parquet_dataset(self, filepath: str, mode: str = "binary", max_samples: int = None,
-                             random_seed: int = 50) -> List[Dict]:
+                             random_seed: int = 50, label_map_path: Optional[str] = None) -> List[Dict]:
         """
-        加载数据，支持随机采样。
-        - 针对 binary 模式：自动执行 1:2 (Safe:Vulnerable) 的降采样平衡。
-        - max_samples: 如果为 None，则加载全部平衡后的数据；否则按 1:2 比例随机抽取指定数量样本。
-        - random_seed: 随机种子，确保多次运行实验时抽取的样本一致。
+        加载数据，支持随机采样和标签映射。
+        - label_map_path: [新增] json 文件路径。如果存在则读取并强制映射；如果不存在则基于当前数据生成并保存。
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Dataset file not found: {filepath}")
@@ -31,7 +30,7 @@ class DatasetLoader:
 
         processed_data = []
 
-        # 2. 核心修改：标签处理与 1:2 数据平衡策略
+        # 2. 标签处理
         if self.mode == "binary":
             df['label'] = df['cwe'].apply(lambda x: 0 if (not x or x == "") else 1)
             safe_df = df[df['label'] == 0]
@@ -39,36 +38,66 @@ class DatasetLoader:
 
             print(f"[*] 原始数据分布: Safe={len(safe_df)}, Vuln={len(vuln_df)}")
 
-            # 确定最终需要的 Safe 和 Vuln 数量
             if max_samples and max_samples < len(df):
-                # 如果指定了上限，按照 1:2 的比例分配
                 safe_needed = max_samples // 3
                 vuln_needed = max_samples - safe_needed
             else:
-                # 如果没有指定上限，按照整体 1:2 的比例最大化利用 Safe 数据
                 safe_needed = len(safe_df)
                 vuln_needed = safe_needed * 2
 
-            # 防御性编程：确保我们要求的数量不会超过实际拥有的数据量
             safe_needed = min(safe_needed, len(safe_df))
             vuln_needed = min(vuln_needed, len(vuln_df), safe_needed * 2)
 
             print(f"[*] 平衡后抽取 (1:2): Safe={safe_needed}, Vuln={vuln_needed} (Seed={random_seed})")
 
-            # 分别进行随机采样
             safe_sampled = safe_df.sample(n=safe_needed, random_state=random_seed)
             vuln_sampled = vuln_df.sample(n=vuln_needed, random_state=random_seed)
 
-            # 合并两部分数据，并再次打乱顺序 (frac=1)
             df = pd.concat([safe_sampled, vuln_sampled]).sample(frac=1, random_state=random_seed).reset_index(drop=True)
             self.label_map = {0: "Safe", 1: "Vulnerable"}
 
         elif self.mode == "multi":
-            # 多分类逻辑保持原样
             df['label_raw'] = df['cwe'].apply(lambda x: "Safe" if (not x or x == "") else x)
-            encoded_labels = self.label_encoder.fit_transform(df['label_raw'])
-            df['label'] = encoded_labels
-            self.label_map = {i: cls for i, cls in enumerate(self.label_encoder.classes_)}
+
+            # ========================================================
+            # [核心修改]：Multi 模式的 JSON 读取与保存逻辑
+            # ========================================================
+            if label_map_path and os.path.exists(label_map_path):
+                # A. 存在预定义映射表：读取并强制对齐
+                print(f"[*] Loading existing label map from {label_map_path}...")
+                with open(label_map_path, 'r', encoding='utf-8') as f:
+                    loaded_map = json.load(f)
+                    # 注意：JSON 序列化时 key 都会变成 string，加载时需要转回 int
+                    self.label_map = {int(k): v for k, v in loaded_map.items()}
+
+                # 构建反向映射表 {CWE: ID}
+                cwe_to_id = {v: k for k, v in self.label_map.items()}
+
+                # 过滤掉模型未见过 (不在映射表中) 的脏数据
+                valid_mask = df['label_raw'].isin(cwe_to_id.keys())
+                dropped_count = len(df) - valid_mask.sum()
+                if dropped_count > 0:
+                    print(f"[!] Warning: Dropped {dropped_count} samples due to unknown CWEs not in the label map.")
+                    df = df[valid_mask].reset_index(drop=True)
+
+                # 执行硬性映射
+                df['label'] = df['label_raw'].map(cwe_to_id)
+
+            else:
+                # B. 不存在映射表：基于当前数据集重新生成
+                print("[*] Generating new label mapping from current dataset...")
+                encoded_labels = self.label_encoder.fit_transform(df['label_raw'])
+                df['label'] = encoded_labels
+                self.label_map = {int(i): cls for i, cls in enumerate(self.label_encoder.classes_)}
+
+                # 如果传入了路径，将其保存为 JSON
+                if label_map_path:
+                    # 确保保存的目录存在
+                    os.makedirs(os.path.dirname(label_map_path) or '.', exist_ok=True)
+                    with open(label_map_path, 'w', encoding='utf-8') as f:
+                        json.dump(self.label_map, f, indent=4, ensure_ascii=False)
+                    print(f"[*] Saved new label map to {label_map_path}")
+            # ========================================================
 
             # 多分类的随机采样
             if max_samples and max_samples < len(df):

@@ -7,15 +7,23 @@ from utils.model_zoo import ModelZoo
 
 
 class IRTGAttacker:
-    def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, top_k=5, mode="binary",
-                 iterations=10, run_mode="attack", optimizer_type="greedy"):
+    def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, mode: str, config: dict):
         self.model_zoo = model_zoo
         self.model_names = model_zoo.model_names
-        self.top_k = top_k
         self.mode = mode
-        self.iterations = iterations
-        self.run_mode = run_mode
-        self.optimizer_type = optimizer_type.lower()  # 统一转小写方便判断
+        self.config = config
+
+        # --- 从 config 中提取参数 ---
+        run_params = config.get('run_params', {})
+        irtg_config = config.get('irtg_attacker', {})
+        global_config = config.get('global', {})
+
+        self.top_k = irtg_config.get('top_k', 5)
+        self.iterations = run_params.get('iterations', 10)
+        self.run_mode = run_params.get('run_mode', 'attack')
+        self.optimizer_type = run_params.get('algorithm', 'greedy').lower()
+        self.result_dir = global_config.get('result_dir', './results')  # 动态读取保存目录
+
         self.attacker_params = {
             "get_all_vars_fn": get_all_vars_fn,
             "get_subs_pool_fn": get_subs_pool_fn,
@@ -39,12 +47,14 @@ class IRTGAttacker:
             if self.optimizer_type == "greedy":
                 optimizers[m] = GreedyOptimizer(
                     self.model_zoo, m, self.attacker_params["rename_fn"],
-                    run_mode=self.run_mode, iterations=self.iterations
+                    mode=self.mode,
+                    config=self.config  # 确保你把整个 config 传进去了
                 )
             else:
                 optimizers[m] = GeneticAlgorithmOptimizer(
                     self.model_zoo, m, self.attacker_params["rename_fn"],
-                    iterations=self.iterations, run_mode=self.run_mode
+                    mode=self.mode,
+                    config=self.config
                 )
 
         for idx, sample in enumerate(dataset):
@@ -59,8 +69,6 @@ class IRTGAttacker:
             raw_variables = self.attacker_params["get_all_vars_fn"](code)
             variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
 
-            # [为了控制台美观，可以将不必要的打印放到 verbose 控制里，或者保持原样]
-            # print("Candidate Generating\n")
             subs_pool = self.attacker_params["get_subs_pool_fn"](code, variables)
             for var in list(subs_pool.keys()):
                 if not subs_pool[var]:
@@ -81,7 +89,7 @@ class IRTGAttacker:
                 if self.optimizer_type == "greedy":
                     # 贪心模式：跳过预处理，全量变量直接交给 Greedy 跑
                     target_vars = variables.copy()
-                    target_scores = None  # Greedy 内部会自动处理 None
+                    target_scores = None
                 else:
                     # GA 模式：必须跑 RNNS 缩小搜索空间并获取分数作为突变权重
                     print("RNNS-Start...")
@@ -98,9 +106,8 @@ class IRTGAttacker:
                     code=code, original_pred=orig_pred, target_vars=target_vars,
                     subs_pool=subs_pool, variable_scores=target_scores
                 )
-                # ==========================================
 
-                # --- 存储逻辑 (保持不变) ---
+                # --- 存储逻辑 ---
                 if self.run_mode == "dataset":
                     storage_orig[atk_model].append({"func": code, "label": ground_truth})
                     storage_adv[atk_model].append({"func": adv_code, "label": ground_truth})
@@ -147,27 +154,23 @@ class IRTGAttacker:
         return asr_matrix
 
     def save_results(self, storage_orig, storage_adv):
-        # 自动创建 results 文件夹（不存在则创建）
-        result_dir = "./results"
+        # 使用从 config 读取的路径
+        result_dir = self.result_dir
         if not os.path.exists(result_dir):
             os.makedirs(result_dir)
 
         for model in self.model_names:
             if self.run_mode == "dataset":
-                # 保存原始样本文件
                 if storage_orig[model]:
                     orig_filename = f"orig_dataset_{model}_{self.mode}.json"
-                    # 拼接路径：results/文件名
                     orig_path = os.path.join(result_dir, orig_filename)
                     self._write_json(orig_path, storage_orig[model])
 
-                # 保存生成的对抗样本文件
                 if storage_adv[model]:
                     adv_filename = f"adv_dataset_{model}_{self.mode}.json"
                     adv_path = os.path.join(result_dir, adv_filename)
                     self._write_json(adv_path, storage_adv[model])
             else:
-                # 攻击模式：保存到一个文件
                 if storage_adv[model]:
                     filename = f"adv_test_set_{model}_{self.mode}.json"
                     file_path = os.path.join(result_dir, filename)

@@ -12,10 +12,11 @@ from utils.ast_tools import CodeTransformer
 
 
 class HeavyWeightCandidateGenerator:
-    def __init__(self, mlm_engine, analyzer):
+    def __init__(self, mlm_engine, analyzer,config):
         self.mlm_engine = mlm_engine
         self.analyzer = analyzer
         self._embedding_cache = {}
+        self.config = config
 
     def _detect_naming_style(self, name: str) -> str:
         if '_' in name:
@@ -357,21 +358,32 @@ class HeavyWeightCandidateGenerator:
             return random.sample(final_candidates, top_n_keep)
         return final_candidates
 
-    def generate_candidates(self, code: str, target_name: str, identifiers=None,
-                            top_k_mlm=60, top_n_keep=50, preserve_style: bool = True,
-                            semantic_threshold: float = 0.2, context_ratio: float = 0.3) -> List[str]:
+    def generate_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
+        """常规生成"""
         return self._generate_core(
-            code, target_name, identifiers, top_k_mlm, top_n_keep,
-            semantic_threshold, context_ratio, preserve_style, strict_structure=False
+            code=code,
+            target_name=target_name,
+            identifiers=identifiers,
+            top_k_mlm=self.config['top_k_mlm'],
+            top_n_keep=self.config['top_n_keep'],
+            semantic_threshold=self.config['semantic_threshold'],
+            context_ratio=self.config['context_ratio'],
+            preserve_style=self.config['preserve_style'],
+            strict_structure=False
         )
 
-    def generate_structural_candidates(self, code: str, target_name: str, identifiers=None,
-                                       top_k_mlm=60, top_n_keep=50,
-                                       semantic_threshold: float = 0.5, context_ratio: float = 0.3) -> List[str]:
+    def generate_structural_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
         """模式二：同构生成（强制一致性风格与严格结构）"""
         return self._generate_core(
-            code, target_name, identifiers, top_k_mlm, top_n_keep,
-            semantic_threshold, context_ratio, preserve_style=True, strict_structure=True
+            code=code,
+            target_name=target_name,
+            identifiers=identifiers,
+            top_k_mlm=self.config['top_k_mlm'],
+            top_n_keep=self.config['top_n_keep'],
+            semantic_threshold=self.config['structural_semantic_threshold'], # 使用专门的阈值
+            context_ratio=self.config['context_ratio'],
+            preserve_style=True,    # 强制开启
+            strict_structure=True   # 强制开启
         )
 
     # ==========================================

@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures
 import random
+import yaml  # 新增 yaml 依赖
 
 import numpy as np
 import torch
@@ -16,37 +17,32 @@ from utils.mlm_engine import MLMEngine
 from utils.model_zoo import ModelZoo, CodeSmoother
 
 
-def main(args):
-    # 1. 初始化核心组件
-    analyzer = IdentifierAnalyzer(lang="cpp")
-    mlm_engine = MLMEngine("microsoft/codebert-base-mlm")
+def main(args, config):
+    # 1. 初始化核心组件 (从 config 中读取配置)
+    analyzer = IdentifierAnalyzer(lang=config['analyzer']['lang'])
+    mlm_engine = MLMEngine(config['mlm_engine']['model_name'])
+
     light_cand_config = {
-        "candidate": {
-            "top_m": 15,
-            "fasttext_model_path": "./models/fasttext_cpp.bin",
-            "faiss_index_path": "./models/faiss_cpp.index",
-            "faiss_vocab_path": "./models/vocab_cpp.json"
-        }
+        "candidate": config['lightweight_candidate']
     }
     lightweight_generator = LightweightCandidateGenerator(light_cand_config)
-    # 2. 中间层：初始化候选词生成器 (依赖 MLM)
-    generator = HeavyWeightCandidateGenerator(mlm_engine, analyzer)
 
+    # 2. 中间层：初始化候选词生成器 (依赖 MLM)
+    generator = HeavyWeightCandidateGenerator(
+        mlm_engine,
+        analyzer,
+        config=config['heavyweight_candidate']
+    )
     # 3. 防御层：初始化平滑器 (依赖生成器)
-    smoother_cfg = {
-        "num_samples": 50,
-        "variance_threshold": 0.05,
-        "replace_prob": 0.5,
-        "batch_size": 32
-    }
+    smoother_cfg = config['smoother']
     smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
+
     # 4. 顶层：初始化 ModelZoo (依赖平滑器)，传入被攻击的靶标模型
-    model_configs = {
-        "CodeBERT": "./models/finetuned_model_codebert_1"
-    }
+    model_configs = config['model_zoo']
     model_zoo = ModelZoo(
         model_configs=model_configs,
         eval_mode=args.mode,
+        config=config,
         smoother=smoother  # 完美注入，没有循环依赖
     )
     transformer = CodeTransformer()
@@ -61,7 +57,9 @@ def main(args):
         code_bytes = code_str.encode("utf-8")
         identifiers = analyzer.extract_identifiers(code_bytes)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        # 读取 config 中的并发数
+        max_workers = config['global'].get('max_workers', 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_var = {
                 executor.submit(
                     generator.generate_structural_candidates,
@@ -86,24 +84,31 @@ def main(args):
         ids = analyzer.extract_identifiers(code_bytes)
         return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
 
-    # 3. 初始化 Attacker (传入 mode 和 iterations)
+    run_params = config['run_params']
+
+    # 3. 初始化 Attacker (从 config 读取 iterations 和 algorithm)
     evaluator = IRTGAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,
         get_subs_pool_fn=get_subs_pool_fn,
         rename_fn=rename_fn,
-        mode=args.mode,  # 告知攻击者当前是二分类还是多分类，用于定义攻击成功逻辑
-        iterations=args.iterations,  # 告知遗传算法迭代次数
-        optimizer_type=args.algorithm
+        mode=args.mode,
+        config=config
     )
 
-    # 4. 加载数据 (使用修改后的 loader)
+    # 4. 加载数据 (从 config 读取 dataset, samples, label_map)
     loader = DatasetLoader()
     print(f"[*] Loading dataset in {args.mode} mode...")
-    dataset = loader.load_parquet_dataset(filepath=args.dataset, mode=args.mode, max_samples=args.samples)
+    dataset = loader.load_parquet_dataset(
+        filepath=run_params['dataset'],
+        mode=args.mode,
+        max_samples=run_params['samples'],
+        label_map_path=run_params.get('label_map')
+    )
 
     # 5. 执行攻击
     asr_matrix_vrtg = evaluator.attack(dataset)
+
     normalier = NormalizationAttacker(
         model_zoo=model_zoo,
         rename_fn=rename_fn,
@@ -123,24 +128,24 @@ def main(args):
         mode=args.mode
     )
     random_attacker.set_analyzer(analyzer)  # 绑定AST分析器
-    asr_matrix_random= random_attacker.attack(dataset)
+    asr_matrix_random = random_attacker.attack(dataset)
 
     print("\n" + "=" * 80)
     print("🏆  MODEL DEFENSE SCORES (模型防御性综合评分)")
-    print("权重分配：VRTG(70%) + Normalization(20%) + Random(10%)")
+
+    # 权重定义从配置文件读取
+    W_VRTG = config['scoring_weights']['W_VRTG']
+    W_NORM = config['scoring_weights']['W_NORM']
+    W_RAND = config['scoring_weights']['W_RAND']
+
+    print(f"权重分配：VRTG({int(W_VRTG * 100)}%) + Normalization({int(W_NORM * 100)}%) + Random({int(W_RAND * 100)}%)")
     print("=" * 80)
 
     model_names = model_zoo.model_names
     defense_scores = {}
 
-    # 权重定义
-    W_VRTG = 0.7
-    W_NORM = 0.2
-    W_RAND = 0.1
-
     for m in model_names:
         # 1. 提取该模型作为目标时的 Self-ASR (对角线数据)
-        # get(m, {}).get(m, 0.0) 确保即便某个模型没数据也不会报错
         vrtg_self_asr = asr_matrix_vrtg.get(m, {}).get(m, 0.0)
         norm_self_asr = asr_matrix_norm.get(m, {}).get(m, 0.0)
         rand_self_asr = asr_matrix_random.get(m, {}).get(m, 0.0)
@@ -176,26 +181,33 @@ def main(args):
     print("=" * 80 + "\n")
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="对抗性样本生成攻击工具")
 
-    # 参数定义
+    # 仅保留 mode 和 config 参数
     parser.add_argument("--mode", type=str, choices=["binary", "multi"], default="binary",
                         help="选择运行模式: binary (二分类) 或 multi (细分)")
-    parser.add_argument("--samples", type=int, default=100,
-                        help="参与攻击的样本数量")
-    parser.add_argument("--dataset", type=str, required=True,
-                        help="数据集路径 (parquet文件)")
-    parser.add_argument("--iterations", type=int, default=20,
-                        help="遗传算法迭代次数")
-    parser.add_argument("--algorithm", type=str, choices=["ga","greedy"], default="ga",
-                        help="使用什么优化算法")
+    parser.add_argument("--config", type=str, default="config.yaml",
+                        help="系统配置文件路径 (YAML格式)")
+
     args = parser.parse_args()
 
-    # 设置随机种子
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    # 读取 YAML 配置
+    try:
+        with open(args.config, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        parser.error(f"❌ 找不到配置文件: {args.config}。请确保文件存在！")
 
-    main(args)
+    # 校验 multi 模式下的 label_map 参数
+    run_params = config.get('run_params', {})
+    if args.mode == "multi" and run_params.get('label_map') is None:
+        parser.error("❌ 当 --mode=multi 时，必须在配置文件中提供 run_params.label_map 参数")
+
+    # 设置随机种子
+    seed = config.get('global', {}).get('random_seed', 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    main(args, config)

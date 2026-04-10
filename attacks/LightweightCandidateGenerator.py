@@ -12,7 +12,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# 延迟导入 (环境中可能没有)
 _FAISS_AVAILABLE = False
 _FT_AVAILABLE = False
 
@@ -37,9 +36,8 @@ class LightweightCandidateGenerator:
     """
 
     def __init__(self, config):
-        self.config = config
-        cand_cfg = config.get("candidate", {})
-        self.top_m = cand_cfg.get("top_m", 10)
+        self.config = config.get("lightweight_candidate", {})
+        self.top_m = self.config.get("top_m", 10)
 
         self.ft_model = None
         self.faiss_index = None
@@ -47,7 +45,7 @@ class LightweightCandidateGenerator:
         self.analyzer = IdentifierAnalyzer()
 
         # 加载 FastText
-        ft_path = cand_cfg.get("fasttext_model_path", "")
+        ft_path = self.config.get("fasttext_model_path", "")
         if _FT_AVAILABLE and ft_path:
             try:
                 self.ft_model = fasttext.load_model(ft_path)
@@ -56,8 +54,8 @@ class LightweightCandidateGenerator:
                 logger.warning(f"FastText 加载失败: {e}")
 
         # 加载 FAISS 索引 + 词表
-        faiss_path = cand_cfg.get("faiss_index_path", "")
-        vocab_path = cand_cfg.get("faiss_vocab_path", "")
+        faiss_path = self.config.get("faiss_index_path", "")
+        vocab_path = self.config.get("faiss_vocab_path", "")
         if _FAISS_AVAILABLE and faiss_path:
             try:
                 self.faiss_index = faiss.read_index(faiss_path)

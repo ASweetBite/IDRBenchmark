@@ -74,43 +74,45 @@ class CodeSmoother:
 # 2. 整合后的 ModelZoo
 # ==========================================
 class ModelZoo:
-    def __init__(self,
-                 model_configs: dict,
-                 eval_mode: str = "binary",
-                 num_classes: int = 16,
-                 smoother=None,
-                 smoother_config=None):  # 直接接收实例化好的 smoother
+    def __init__(self, model_configs: dict, eval_mode: str, config: dict, smoother=None):
+        # 1. 基础环境设置
+        glob_cfg = config.get('global', {})
+        run_cfg = config.get('run_params', {})
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(glob_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        self.eval_mode = eval_mode
+        self.num_classes = run_cfg.get('num_classes', 16)
+        self.max_seq_len = run_cfg.get('max_seq_len', 512)
+
         self.models = {}
         self.model_names = list(model_configs.keys())
-        self.eval_mode = eval_mode
-        self.num_classes = num_classes
-        self.smoother = smoother
+        self.smoother = smoother  # 已注入的平滑器
 
-        # 初始化平滑防御机制
-        if smoother_config:
-            print("[*] 随机平滑防御机制 (Targeted Randomized Smoother) 已启用。")
-
-        # --- 模型加载逻辑 (与之前一致) ---
+        # 2. 批量加载被攻击的模型
         for name, path in model_configs.items():
             print(f"[*] Loading Model[{name}] from {path}...")
             if not os.path.exists(path):
                 print(f"[!] Path {path} not found. Skipping {name}.")
-                self.models[name] = None
                 continue
 
             try:
+                # 检查是否是双头模型
                 if os.path.exists(os.path.join(path, "dual_heads.pt")):
-                    print(f"[*] 检测到 dual_heads.pt，启用双头模型加载器...")
-                    # 此处假设 CodeBERTModelLoader 已被导入
-                    config = {"model": {"model_name": path, "max_seq_len": 512, "device": str(self.device)},
-                              "data": {"num_classes": self.num_classes}}
-                    loader = CodeBERTModelLoader(config)
-                    model_obj, tokenizer = loader.load_model()
+                    print(f"[*] 检测到双头模型，正在初始化加载器...")
+                    # 动态构建 loader 配置
+                    loader_cfg = {
+                        "model": {
+                            "model_name": path,
+                            "max_seq_len": self.max_seq_len,
+                            "device": str(self.device)
+                        },
+                        "data": {"num_classes": self.num_classes}
+                    }
+                    loader = CodeBERTModelLoader(loader_cfg)
+                    model_obj, _ = loader.load_model()
                     self.models[name] = {"type": "dual_head", "model_obj": model_obj}
                 else:
-                    print(f"[*] 使用标准 HuggingFace 分类器加载...")
+                    print(f"[*] 加载标准 HF 分类器...")
                     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
                     model = AutoModelForSequenceClassification.from_pretrained(path, trust_remote_code=True).to(
                         self.device)
@@ -118,20 +120,6 @@ class ModelZoo:
                     self.models[name] = {"type": "standard", "tokenizer": tokenizer, "model": model}
             except Exception as e:
                 print(f"[!] Error loading {name}: {e}")
-                self.models[name] = None
-
-        print("[*] 正在加载 MLM 基础模型用于特征提取...")
-        self.mlm_tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base-mlm")
-        self.mlm_model = AutoModelForMaskedLM.from_pretrained("microsoft/codebert-base-mlm").to(self.device)
-        self.mlm_model.eval()
-
-    def get_embedding(self, code: str) -> np.ndarray:
-        tokens = self.mlm_tokenizer(code, return_tensors="pt", truncation=True, max_length=512,
-                                    padding="max_length").to(self.device)
-        with torch.no_grad():
-            outputs = self.mlm_model.base_model(**tokens)
-            embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-        return embedding.squeeze()
 
     def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
         m = self.models.get(target_model)
@@ -222,9 +210,6 @@ class ModelZoo:
 
             return all_probs, all_preds
 
-    # ==========================================
-    # 3. 核心新增：带平滑防御的推理接口
-    # ==========================================
     def predict_with_rejection(self, code: str, target_model: str,
                                candidate_dict: dict = None, sensitive_vars: list = None) -> Tuple[
         Union[int, str], float, float]:
