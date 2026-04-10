@@ -55,27 +55,18 @@ def main(args, config):
     def get_subs_pool_fn(code_str: str, variables: list) -> dict:
         pool = {}
         code_bytes = code_str.encode("utf-8")
+
+        # 提取 AST 标识符只需做一次
         identifiers = analyzer.extract_identifiers(code_bytes)
 
-        # 读取 config 中的并发数
-        max_workers = config['global'].get('max_workers', 4)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_var = {
-                executor.submit(
-                    generator.generate_structural_candidates,
-                    code_str, var, identifiers
-                ): var
-                for var in variables
-            }
-
-            for future in concurrent.futures.as_completed(future_to_var):
-                var = future_to_var[future]
-                try:
-                    # 收集生成的候选词
-                    pool[var] = future.result()
-                except Exception as e:
-                    print(f"[Warning] Failed to generate for {var}: {e}")
-                    pool[var] = []
+        for var in variables:
+            try:
+                pool[var] = generator.generate_structural_candidates(
+                    code_str, var, identifiers=identifiers
+                )
+            except Exception as e:
+                print(f"[Warning] Failed to generate for {var}: {e}")
+                pool[var] = []
 
         return pool
 
