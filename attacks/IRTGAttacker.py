@@ -7,7 +7,6 @@ from utils.model_zoo import ModelZoo
 
 
 class IRTGAttacker:
-    # 2. 在 __init__ 中增加 optimizer_type 参数，默认为 "ga"
     def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, top_k=5, mode="binary",
                  iterations=10, run_mode="attack", optimizer_type="greedy"):
         self.model_zoo = model_zoo
@@ -28,11 +27,10 @@ class IRTGAttacker:
                  for atk in self.model_names}
 
         # 存储容器
-        # dataset 模式下：存储两个独立的列表
-        # attack 模式下：存储原始-对抗对
         storage_orig = {m: [] for m in self.model_names}
         storage_adv = {m: [] for m in self.model_names}
 
+        # 只有在使用非贪心搜索（GA）时，才真正需要用到 rankers
         rankers = {m: RNNS_Ranker(self.model_zoo, m, self.attacker_params["rename_fn"]) for m in self.model_names}
 
         # 3. 根据指定的 optimizer_type 选择优化器类
@@ -44,7 +42,7 @@ class IRTGAttacker:
                     run_mode=self.run_mode, iterations=self.iterations
                 )
             else:
-                    optimizers[m] = GeneticAlgorithmOptimizer(
+                optimizers[m] = GeneticAlgorithmOptimizer(
                     self.model_zoo, m, self.attacker_params["rename_fn"],
                     iterations=self.iterations, run_mode=self.run_mode
                 )
@@ -60,7 +58,9 @@ class IRTGAttacker:
 
             raw_variables = self.attacker_params["get_all_vars_fn"](code)
             variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
-            print("Candidate Generating\n")
+
+            # [为了控制台美观，可以将不必要的打印放到 verbose 控制里，或者保持原样]
+            # print("Candidate Generating\n")
             subs_pool = self.attacker_params["get_subs_pool_fn"](code, variables)
             for var in list(subs_pool.keys()):
                 if not subs_pool[var]:
@@ -73,28 +73,32 @@ class IRTGAttacker:
             for atk_model in self.model_names:
                 orig_pred = orig_predictions[atk_model]["pred"]
 
-                # if orig_pred != ground_truth:
-                #     continue
-
                 # 4. 打印当前使用的模式
                 print(
                     f"\n[Sample {idx + 1}] Target={atk_model} | Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)...")
                 stats[atk_model][atk_model]["total"] += 1
 
-                print("RNNS-Start\n")
-                ranked_vars, all_scores = rankers[atk_model].rank_variables(
-                    code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred,
-                    top_k=max(self.top_k, int(len(variables) * 0.3))
-                )
-                target_vars = ranked_vars
-                target_scores = {var: all_scores[var] for var in target_vars}
+                if self.optimizer_type == "greedy":
+                    # 贪心模式：跳过预处理，全量变量直接交给 Greedy 跑
+                    target_vars = variables.copy()
+                    target_scores = None  # Greedy 内部会自动处理 None
+                else:
+                    # GA 模式：必须跑 RNNS 缩小搜索空间并获取分数作为突变权重
+                    print("RNNS-Start...")
+                    ranked_vars, all_scores = rankers[atk_model].rank_variables(
+                        code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred,
+                        top_k=max(self.top_k, int(len(variables) * 0.3))
+                    )
+                    target_vars = ranked_vars
+                    target_scores = {var: all_scores[var] for var in target_vars}
 
-                # 5. 调用统一命名的 optimizers 字典
-                print("GA-Start\n")
+                # 5. 调用统一命名的 optimizers 字典，打印日志自适应
+                print(f"{self.optimizer_type.upper()}-Start...")
                 is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(
                     code=code, original_pred=orig_pred, target_vars=target_vars,
                     subs_pool=subs_pool, variable_scores=target_scores
                 )
+                # ==========================================
 
                 # --- 存储逻辑 (保持不变) ---
                 if self.run_mode == "dataset":
