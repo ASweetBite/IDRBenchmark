@@ -1,5 +1,5 @@
+import concurrent.futures
 import random
-import math
 from utils.model_zoo import ModelZoo
 
 class GeneticAlgorithmOptimizer:
@@ -48,20 +48,27 @@ class GeneticAlgorithmOptimizer:
 
             previous_best_fitness = best_fitness
 
-            for ind in population:
-                rename_map = {k: v for k, v in ind.items() if k != v}
-                cache_key = frozenset(rename_map.items())
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                future_to_key = {}
+                for ind in population:
+                    rename_map = {k: v for k, v in ind.items() if k != v}
+                    cache_key = frozenset(rename_map.items())
 
-                if cache_key not in fitness_cache:
-                    # --- 修改点：增加异常捕获 ---
+                    if cache_key not in fitness_cache:
+                        # 提交到线程池
+                        future = executor.submit(self.rename_fn, code, rename_map)
+                        future_to_key[future] = cache_key
+
+                # 收集并发执行的结果
+                for future in concurrent.futures.as_completed(future_to_key):
+                    cache_key = future_to_key[future]
                     try:
-                        mutated_code = self.rename_fn(code, rename_map)
+                        mutated_code = future.result()
                         codes_to_predict.append(mutated_code)
                         keys_to_predict.append(cache_key)
                     except Exception:
-                        # 如果这组重命名方案冲突，将其记录为极低的适应度或跳过
+                        # 作用域冲突或异常，记录极低适应度
                         fitness_cache[cache_key] = (float('-inf'), original_pred, code, None)
-                        continue
 
             if codes_to_predict:
                 batch_probs, batch_preds = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
@@ -176,18 +183,24 @@ class GreedyOptimizer:
                 continue
 
             codes_to_predict = []
-            for cand in candidates:
-                if cand == var: continue
 
-                # --- 修改重点：增加 try-except 捕获作用域冲突 ---
-                try:
-                    temp_code = self.rename_fn(current_code, {var: cand})
-                    codes_to_predict.append((cand, temp_code))
-                except Exception as e:
-                    # 如果发生作用域冲突或重命名错误，直接忽略这个候选词
-                    # print(f"    [Skip] {var} -> {cand} due to conflict")
-                    continue
-                # ----------------------------------------------
+            # 使用多线程并行生成候选代码
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                future_to_cand = {}
+                for cand in candidates:
+                    if cand == var: continue
+                    # 提交到线程池
+                    future = executor.submit(self.rename_fn, current_code, {var: cand})
+                    future_to_cand[future] = cand
+
+                # 收集并发执行的结果
+                for future in concurrent.futures.as_completed(future_to_cand):
+                    cand = future_to_cand[future]
+                    try:
+                        temp_code = future.result()
+                        codes_to_predict.append((cand, temp_code))
+                    except Exception:
+                        continue
 
             if not codes_to_predict:
                 continue

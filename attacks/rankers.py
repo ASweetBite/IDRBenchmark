@@ -40,10 +40,11 @@ class RNNS_Ranker:
         else:
             valid_vars = variables
 
-        # 记录所有需要批量推断的任务
+            # 记录所有需要批量推断的任务
         mutation_tasks = []  # 格式: [(var_name, renamed_code), ...]
 
-        # 3. 准备所有候选替换代码
+        # 3.1 预先收集所有需要进行替换的 (变量, 候选词) 组合
+        pending_renames = []
         for var in valid_vars:
             candidates = subs_pool.get(var, [])
             if not candidates:
@@ -51,27 +52,46 @@ class RNNS_Ranker:
 
             var_emb = self._get_word_embedding(var)
 
-            # 计算相似度
+            # 计算相似度 (这里的 NumPy 运算极快，不用放进线程池)
             candidate_sims = [
                 (cand, self._cosine_similarity(var_emb, self._get_word_embedding(cand)))
                 for cand in candidates
             ]
 
-            # 优化点A：使用 heapq 代替 sort 获取 Top-N 最相似候选词，时间复杂度 O(C + N log C)
+            # 获取 Top-N 最相似候选词
             top_candidates = heapq.nlargest(test_sample_size, candidate_sims, key=lambda x: x[1])
 
-            # 生成替换后的代码，并加入任务队列
             for cand, _ in top_candidates:
-                renamed_code = self.rename_fn(code, {var: cand})
-                mutation_tasks.append((var, renamed_code))
+                pending_renames.append((var, cand))
 
-        # 边界情况处理：如果没有任何可替换的词
+            # 3.2 使用多线程并发执行 rename_fn，彻底消除 AST 串行阻塞
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                # 提交所有的 AST 替换任务
+                future_to_task = {
+                    executor.submit(self.rename_fn, code, {var: cand}): var
+                    for var, cand in pending_renames
+                }
+
+                # 收集并发执行的结果
+            for future in concurrent.futures.as_completed(future_to_task):
+                var = future_to_task[future]
+                try:
+                    renamed_code = future.result()
+                    mutation_tasks.append((var, renamed_code))
+                except Exception as e:
+                    # 捕获异常：如果发生作用域冲突或语法树错误，直接跳过这个变体
+                    # print(f"    [RNNS Skip] Conflict generating code for var: {var}")
+                    continue
+
+            # 边界情况处理：如果没有任何可替换的词
         if not mutation_tasks:
             return [], {}
 
         # ================= 核心提速区 =================
         # 4. 提取所有代码进行 GPU 批量推断 (Global Batching)
         codes_to_predict = [task[1] for task in mutation_tasks]
+        # ... 后续逻辑保持不变 ...
 
         # 调用 ModelZoo 提供的 batch_predict
         # batch_size 取决于你的显存大小，ModelZoo 默认是 32

@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import random
 
 import numpy as np
@@ -41,7 +42,7 @@ def main(args):
     smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
     # 4. 顶层：初始化 ModelZoo (依赖平滑器)，传入被攻击的靶标模型
     model_configs = {
-        "CodeBERT": "./models/finetuned_model_codebert"
+        "CodeBERT": "./models/finetuned_model_codebert_1"
     }
     model_zoo = ModelZoo(
         model_configs=model_configs,
@@ -59,8 +60,25 @@ def main(args):
         pool = {}
         code_bytes = code_str.encode("utf-8")
         identifiers = analyzer.extract_identifiers(code_bytes)
-        for var in variables:
-            pool[var] = generator.generate_structural_candidates(code_str, var, identifiers=identifiers)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_var = {
+                executor.submit(
+                    generator.generate_structural_candidates,
+                    code_str, var, identifiers
+                ): var
+                for var in variables
+            }
+
+            for future in concurrent.futures.as_completed(future_to_var):
+                var = future_to_var[future]
+                try:
+                    # 收集生成的候选词
+                    pool[var] = future.result()
+                except Exception as e:
+                    print(f"[Warning] Failed to generate for {var}: {e}")
+                    pool[var] = []
+
         return pool
 
     def rename_fn(code_str: str, renaming_map: dict) -> str:
@@ -69,7 +87,6 @@ def main(args):
         return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
 
     # 3. 初始化 Attacker (传入 mode 和 iterations)
-    # 确保你的VRTGAttacker 类初始化支持这两个新参数
     evaluator = IRTGAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,

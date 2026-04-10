@@ -14,8 +14,8 @@ class IdentifierAnalyzer:
         else:
             raise ValueError("Unsupported language. Choose 'c' or 'cpp'.")
 
-        self.parser = Parser()
-        self.parser.language = self.language
+        # self.parser = Parser()
+        # self.parser.language = self.language
 
         self.keywords = {
             "int", "char", "float", "double", "void", "if", "else", "for", "while", "return",
@@ -33,7 +33,9 @@ class IdentifierAnalyzer:
         }
 
     def extract_identifiers(self, source_code: bytes) -> dict:
-        tree = self.parser.parse(source_code)
+        parser = Parser()
+        parser.language = self.language
+        tree = parser.parse(source_code)
         identifiers = defaultdict(list)
 
         scope_stack = [{
@@ -54,7 +56,6 @@ class IdentifierAnalyzer:
             'for_statement'
         }
 
-        # 【修正】去除了 'qualified_identifier'，以支持重命名类外定义 (MyClass::Method)
         excluded_parents = {
             'preproc_def',
             'preproc_function_def',
@@ -90,7 +91,6 @@ class IdentifierAnalyzer:
                 })
                 entered_scope = True
 
-            # 捕捉普通标识符 和 结构体/类的成员调用或方法声明 (field_identifier)
             if node.type in ["identifier", "field_identifier"]:
                 parent_type = node.parent.type if node.parent else None
                 name = source_code[node.start_byte:node.end_byte].decode("utf-8")
@@ -168,7 +168,6 @@ class IdentifierAnalyzer:
         return dict(identifiers)
 
     def get_identifier_scope_ranges(self, source_code: bytes, var_name: str):
-        # ... 保持不变 ...
         identifiers = self.extract_identifiers(source_code)
         if var_name not in identifiers:
             return []
@@ -180,13 +179,11 @@ class IdentifierAnalyzer:
 
     @staticmethod
     def scopes_overlap(scope_a, scope_b) -> bool:
-        # ... 保持不变 ...
         a_start, a_end = scope_a
         b_start, b_end = scope_b
         return not (a_end <= b_start or b_end <= a_start)
 
     def can_rename_to(self, source_code: bytes, old_name: str, new_name: str) -> bool:
-        # ... 保持不变 ...
         identifiers = self.extract_identifiers(source_code)
 
         if old_name == new_name:
@@ -243,7 +240,6 @@ def is_valid_identifier(name: str) -> bool:
 class CodeTransformer:
     @staticmethod
     def validate_and_apply(source_code: bytes, identifiers: dict, renaming_map: dict, analyzer=None) -> str:
-        # 保持不变，代码依然适用
         for old_name, new_name in renaming_map.items():
             if not is_valid_identifier(new_name):
                 raise ValueError(f"命名不合法: '{new_name}'")
