@@ -1,23 +1,24 @@
-# 核心全局配置
+# Core Global Configuration
 global:
   random_seed: 42
-  max_workers: 8  # 统一控制所有并发环节的线程数
+  max_workers: 8
   result_dir: "./results"
 
-# 运行参数
+# Runtime Parameters
 run_params:
   samples: 100
   dataset: "./data/big_vul.parquet"
-  iterations: 20  # 对应 GA 的 max_generations 或 Greedy 的迭代逻辑
+  iterations: 20
   algorithm: "greedy"
   run_mode: "attack"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   use_majority_voting: true
 
+# Target Models
 model_zoo:
   CodeBERT: "./models/finetuned_model_codebert_1"
 
-# 候选词生成配置
+# Candidate Generation Configurations
 lightweight_candidate:
   top_m: 15
   fasttext_model_path: "./models/fasttext_cpp.bin"
@@ -32,9 +33,9 @@ heavyweight_candidate:
   context_ratio: 0.3
   preserve_style: true
 
-# 攻击者与优化器配置
+# Attacker and Optimizer Configurations
 irtg_attacker:
-  top_k: 5  # RNNS 排序取前 K 个变量
+  top_k: 5
 
 genetic_algorithm:
   pop_size: 40
@@ -43,7 +44,7 @@ genetic_algorithm:
   mutation_rate_max: 0.5
   elite_ratio: 0.25
 
-# 其他组件
+# Other System Components
 analyzer:
   lang: "cpp"
 mlm_engine:

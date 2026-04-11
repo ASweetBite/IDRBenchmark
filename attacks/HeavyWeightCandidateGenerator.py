@@ -12,13 +12,17 @@ from utils.ast_tools import CodeTransformer
 
 
 class HeavyWeightCandidateGenerator:
-    def __init__(self, mlm_engine, analyzer,config):
+    """Generates context-aware identifier candidates using Masked Language Modeling and AST validation."""
+
+    def __init__(self, mlm_engine, analyzer, config):
+        """Initializes the generator with a language model engine, AST analyzer, and configuration."""
         self.mlm_engine = mlm_engine
         self.analyzer = analyzer
         self._embedding_cache = {}
         self.config = config
 
     def _detect_naming_style(self, name: str) -> str:
+        """Determines the naming convention of a given identifier string."""
         if '_' in name:
             return 'SCREAMING_SNAKE' if name.isupper() else 'snake_case'
         elif name.islower():
@@ -32,12 +36,14 @@ class HeavyWeightCandidateGenerator:
         return 'unknown'
 
     def _matches_style(self, original_style: str, candidate: str) -> bool:
+        """Checks if a candidate identifier matches the required naming style."""
         cand_style = self._detect_naming_style(candidate)
         if original_style in ('snake_case', 'camelCase', 'PascalCase') and cand_style == 'single_lower':
             return True
         return cand_style == original_style
 
     def _get_word_embedding(self, word: str) -> Any | None:
+        """Retrieves and caches word embeddings from the MLM engine, ensuring CPU offloading."""
         if word in self._embedding_cache:
             return self._embedding_cache[word]
 
@@ -49,12 +55,12 @@ class HeavyWeightCandidateGenerator:
         with torch.no_grad():
             embeddings = self.mlm_engine.model.get_input_embeddings()(tokens)
 
-        # 将 tensor 移动到 CPU 并剥离计算图，防止 GPU 显存泄漏，然后存入缓存
         emb_mean = embeddings.mean(dim=0).cpu().detach()
         self._embedding_cache[word] = emb_mean
         return emb_mean
 
     def _split_identifier(self, name: str):
+        """Deconstructs an identifier into its constituent word parts based on naming style."""
         if '_' in name:
             return name.split('_'), '_'
         else:
@@ -65,6 +71,7 @@ class HeavyWeightCandidateGenerator:
 
     def _build_masked_string(self, parts: List[str], start: int, end: int, num_masks: int, style: str, mask_token: str,
                              target_name: str) -> str:
+        """Constructs a string where specific identifier parts are replaced by mask tokens."""
         mask_list = [mask_token] * num_masks
         new_parts = parts[:start] + mask_list + parts[end:]
 
@@ -83,6 +90,7 @@ class HeavyWeightCandidateGenerator:
 
     def _assemble_multi_candidate(self, parts: List[str], start: int, end: int, predicted_words: tuple, style: str,
                                   target_name: str) -> str:
+        """Reassembles an identifier using words predicted by the model at masked positions."""
         new_parts = parts[:start] + list(predicted_words) + parts[end:]
 
         if style == '_':
@@ -95,12 +103,11 @@ class HeavyWeightCandidateGenerator:
         else:
             return "".join(predicted_words)
 
-    # [优化] 将单次推理重构为支持 Batch 的并行推理
     def _get_model_logits_batched(self, cropped_codes: List[str]):
+        """Performs batch inference to obtain model logits and mask indices for multiple code snippets."""
         if not cropped_codes:
             return None, []
 
-        # 必须加上 padding=True 以支持变长文本的批处理
         inputs = self.mlm_engine.tokenizer(
             cropped_codes, return_tensors="pt", padding=True, truncation=True, max_length=512
         ).to(self.mlm_engine.device)
@@ -118,6 +125,7 @@ class HeavyWeightCandidateGenerator:
         return batch_logits, batch_mask_indices
 
     def _decode_words(self, mask_logits, top_k, allow_underscore=False, required_length=None):
+        """Decodes model logits into a list of candidate words filtered by style and length constraints."""
         _, top_indices = torch.topk(mask_logits, top_k, dim=-1)
         words = []
         for idx in top_indices:
@@ -134,8 +142,8 @@ class HeavyWeightCandidateGenerator:
             words.append(w)
         return words
 
-    # [新增] 抽离单次 AST 校验逻辑，供线程池使用
     def _verify_ast_single(self, cand: str, ctx: dict) -> str | None:
+        """Validates if a specific candidate renaming is syntactically correct and doesn't conflict in the AST."""
         if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
             return None
         try:
@@ -146,6 +154,7 @@ class HeavyWeightCandidateGenerator:
             return None
 
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
+        """Filters candidates based on semantic similarity, naming style, and keyword conflicts."""
         filtered_cands = []
         for cand in candidate_list:
             if cand in ctx['keywords'] or cand == ctx['target_name']: continue
@@ -164,8 +173,7 @@ class HeavyWeightCandidateGenerator:
 
             if cand_embs:
                 cand_tensor = torch.stack(cand_embs).to(ctx['original_emb'].device)
-                orig_tensor = ctx['original_emb'].unsqueeze(0)  # [1, hidden_size]
-
+                orig_tensor = ctx['original_emb'].unsqueeze(0)
                 sims = F.cosine_similarity(orig_tensor, cand_tensor)
 
                 for cand, sim in zip(valid_cands_temp, sims):
@@ -174,23 +182,22 @@ class HeavyWeightCandidateGenerator:
         else:
             semantically_valid = filtered_cands
 
-            added = 0
-            for cand in semantically_valid:
-                if added >= quota:
-                    break
+        added = 0
+        for cand in semantically_valid:
+            if added >= quota:
+                break
 
-                valid_cand = self._verify_ast_single(cand, ctx)
+            valid_cand = self._verify_ast_single(cand, ctx)
+            if valid_cand and valid_cand not in final_candidates:
+                final_candidates.append(valid_cand)
+                added += 1
 
-                if valid_cand and valid_cand not in final_candidates:
-                    final_candidates.append(valid_cand)
-                    added += 1
-
-            return added
+        return added
 
     def _generate_core(self, code: str, target_name: str, identifiers: dict,
                        top_k_mlm: int, top_n_keep: int, semantic_threshold: float,
                        context_ratio: float, preserve_style: bool, strict_structure: bool) -> List[str]:
-
+        """Orchestrates the candidate generation process including masking, batch inference, and filtering."""
         if len(target_name.strip('_')) <= 1: return []
         if target_name.startswith('__') and target_name.endswith('__'): return []
 
@@ -201,11 +208,9 @@ class HeavyWeightCandidateGenerator:
         if target_name not in identifiers: return []
 
         original_style = self._detect_naming_style(target_name)
-
-        # [优化] 原始词向量提取也会受益于内部转至 CPU，并保持相同的 tensor 所在设备
         original_emb = self._get_word_embedding(target_name) if semantic_threshold > 0 else None
         if original_emb is not None:
-            original_emb = original_emb.to(self.mlm_engine.device)  # 确保计算相似度时与后续 tensor 在同一设备
+            original_emb = original_emb.to(self.mlm_engine.device)
 
         target_info = identifiers[target_name][0]
         prefix = code_bytes[:target_info['start']]
@@ -238,31 +243,25 @@ class HeavyWeightCandidateGenerator:
                         if (e - s) > 1:
                             variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
 
-        # [优化] 收集所有上下文文本进行一次性批量推理
         cropped_codes = []
         context_half = 700
         mask_start = len(prefix)
 
-        # [优化] 预先将 prefix 和 suffix 转换为 str，减少循环内的重复 decode 耗时
         prefix_str = prefix[max(0, mask_start - context_half):].decode("utf-8", errors="replace")
         suffix_str = suffix[:context_half].decode("utf-8", errors="replace")
 
         for var in variations:
             masked_var = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style, mask_token,
                                                    target_name)
-            # 直接通过字符串拼接构建 cropped_code，极大地减少 IO 开销
             cropped_code = prefix_str + masked_var + suffix_str
             cropped_codes.append(cropped_code)
 
-        # 批量进行模型推理
         batch_logits, batch_mask_indices = self._get_model_logits_batched(cropped_codes)
 
         raw_full_cands, raw_sub_cands_lists = [], []
 
-        # 推理完成后，遍历解包对应的数据
         if batch_logits is not None:
             for i, var in enumerate(variations):
-                # 抽取当前样本的 logits (保持三维张量结构 [1, seq_len, vocab_size])
                 logits = batch_logits[i:i + 1]
                 mask_indices = batch_mask_indices[i]
 
@@ -331,7 +330,6 @@ class HeavyWeightCandidateGenerator:
         self._verify_and_filter(unique_sub, top_n_keep - actual_full, final_candidates, ctx, is_full_context=False)
 
         if strict_structure and len(final_candidates) < top_n_keep:
-            # 假设你原本有 _generate_structural_fallback 实现，这里保留逻辑
             if hasattr(self, '_generate_structural_fallback'):
                 local_cands = self._generate_structural_fallback(code_bytes, target_name, identifiers,
                                                                  top_n_keep - len(final_candidates))
@@ -344,7 +342,7 @@ class HeavyWeightCandidateGenerator:
         return final_candidates
 
     def generate_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
-        """常规生成"""
+        """Performs standard context-aware candidate generation."""
         return self._generate_core(
             code=code,
             target_name=target_name,
@@ -358,30 +356,26 @@ class HeavyWeightCandidateGenerator:
         )
 
     def generate_structural_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
-        """模式二：同构生成（强制一致性风格与严格结构）"""
+        """Generates isomorphic candidates by enforcing strict naming style and structural consistency."""
         return self._generate_core(
             code=code,
             target_name=target_name,
             identifiers=identifiers,
             top_k_mlm=self.config['top_k_mlm'],
             top_n_keep=self.config['top_n_keep'],
-            semantic_threshold=self.config['structural_semantic_threshold'], # 使用专门的阈值
+            semantic_threshold=self.config['structural_semantic_threshold'],
             context_ratio=self.config['context_ratio'],
-            preserve_style=True,    # 强制开启
-            strict_structure=True   # 强制开启
+            preserve_style=True,
+            strict_structure=True
         )
 
-    # ==========================================
-    # 模式二：降级保护兜底 (原始结构拼接逻辑)
-    # ==========================================
     def _generate_structural_fallback(self, code_bytes: bytes, target_name: str, identifiers: dict, num_needed: int) -> \
     List[str]:
-        """由于长度和语义校验过于严苛，在候选项不足时，使用本地标识符词库进行无脑盲拼兜底"""
+        """Provides a fallback mechanism by assembling candidates from local identifier fragments when MLM fails."""
         format_info = self.analyzer.analyze_format(target_name)
         target_lengths = format_info['lengths']
         local_names = list(identifiers.keys())
 
-        # 直接使用本地文件内的变量词碎块构建长度池
         pool = defaultdict(set)
         for name in local_names:
             parts = re.findall(r'[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z][a-z0-9]|\b)|[a-z0-9]+', name)
@@ -391,7 +385,7 @@ class HeavyWeightCandidateGenerator:
         length_pool = {length: list(words) for length, words in pool.items()}
 
         fallback_candidates = []
-        for _ in range(50):  # 试拼 50 次
+        for _ in range(50):
             sampled_words = []
             for length in target_lengths:
                 if length in length_pool and length_pool[length]:
@@ -400,7 +394,6 @@ class HeavyWeightCandidateGenerator:
                     break
 
             if len(sampled_words) == len(target_lengths):
-                # 按原风格拼接
                 if format_info['style'] == "snake_case":
                     assembled = "_".join(sampled_words)
                 elif format_info['style'] == "camelCase":
@@ -415,16 +408,11 @@ class HeavyWeightCandidateGenerator:
         return list(dict.fromkeys(fallback_candidates))[:num_needed]
 
     def get_top_mlm_words(self, code_bytes: bytes, target_name: str, top_k=20) -> List[str]:
-        """
-        通用的 MLM 单词预测逻辑：返回最适合 target_name 位置的原始单词列表
-        """
+        """Predicts the most suitable raw words for a masked identifier position using the MLM model."""
         mask_token = self.mlm_engine.tokenizer.mask_token
-        # 1. 掩码替换
         pattern = rf'\b{re.escape(target_name)}\b'.encode()
         masked_code_bytes = re.sub(pattern, mask_token.encode(), code_bytes, count=1)
 
-        # 2. 裁剪上下文 (参考你原有的逻辑)
-        # ... (此处省略部分裁剪逻辑，建议直接复用你 generate_candidates 里的截断代码)
         inputs = self.mlm_engine.tokenizer(
             masked_code_bytes.decode(errors='replace'),
             return_tensors="pt", truncation=True, max_length=512
@@ -443,41 +431,28 @@ class HeavyWeightCandidateGenerator:
         words = []
         for idx in top_k_indices:
             word = self.mlm_engine.tokenizer.decode([idx]).strip().lower()
-            word = re.sub(r'[^a-z]', '', word)  # 只保留纯字母
+            word = re.sub(r'[^a-z]', '', word)
             if len(word) > 1:
                 words.append(word)
         return words
 
     def _infer_type_from_code(self, code: str, target_name: str) -> str:
-        """
-        增强版正则回溯：支持多变量声明、无空格指针等复杂 C/C++ 语法
-        """
-        # 匹配模式升级：
-        # 1. [\w\s\*,&:]*? 允许类型名中包含逗号(多变量)、&号(引用)、::(命名空间)
-        # 2. \s* 允许变量名前没有空格 (例如 int *var)
+        """Heuristically infers the data type of an identifier from its surrounding C/C++ source code."""
         pattern = r'([a-zA-Z_][\w\s\*,&:]*?)\s*\b' + re.escape(target_name) + r'\b\s*[\[=;,)]'
         match = re.search(pattern, code)
 
         if match:
             type_part = match.group(1).strip()
-
-            # --- 脏数据清洗 ---
-            # 如果匹配到了 "int a, b, "，我们只取逗号最前面的基础类型 "int a"
             if ',' in type_part:
                 type_part = type_part.split(',')[0].strip()
-                # 去掉多余的变量名，比如 "int a" -> 变成 "int"
                 type_part = ' '.join([word for word in type_part.split() if word in
                                       ["int", "long", "short", "char", "float", "double", "unsigned", "signed",
                                        "struct", "class"]])
 
-            # 清理掉 static, const, inline 等修饰符
             type_part = re.sub(r'\b(static|const|inline|extern|volatile|register)\b', '', type_part).strip()
-
-            # 如果清洗完不为空，返回类型
             if type_part:
                 return type_part
 
-        # 函数参数定义兜底匹配 (int a, char *b)
         param_pattern = r'([a-zA-Z_][\w\s\*,&:]*?)\s*\b' + re.escape(target_name) + r'\b\s*[,)]'
         match = re.search(param_pattern, code)
         if match:
@@ -486,32 +461,16 @@ class HeavyWeightCandidateGenerator:
             if type_part:
                 return type_part
 
-        # 如果实在找不到，返回 void
         return "void"
 
     def generate_normalized_name(self, code: str, target_name: str, var_type: str, excluded_names: set) -> str:
-        """
-        完全从 code 中推断类型并生成名字
-        支持规则：
-        1. 函数 -> fun_mask
-        2. 类实例 -> 类名_mask
-        3. 基础变量 -> int_mask / pointer_mask / char_mask
-        """
-
-        # --- 【新增规则】：判断是否为函数 ---
-        # 如果目标名字在代码中以 "名字(" 或 "名字 (" 的形式出现，则判定为函数
+        """Generates a normalized identifier name based on inferred type and context-aware MLM predictions."""
         if re.search(r'\b' + re.escape(target_name) + r'\s*\(', code):
             category = "fun"
-
         else:
-            # --- 原有的变量推断逻辑 ---
             inferred_type = self._infer_type_from_code(code, target_name)
-
-            # 1. 提取核心类型并清理修饰符
             clean_type = re.sub(r'\b(struct|class|enum|union)\b', '', inferred_type).strip()
             is_pointer = "*" in inferred_type or "*" in clean_type
-
-            # 提取最后一个词作为核心词
             core_type = clean_type.replace("*", "").replace("&", "").strip()
             core_type = core_type.split()[-1] if core_type else "void"
 
@@ -519,26 +478,19 @@ class HeavyWeightCandidateGenerator:
                               "uint64_t", "int32_t", "uint8_t"]
             primitives_char = ["char"]
 
-            # 2. 确定类别前缀 (category)
             if core_type == "void":
                 category = "var"
             elif core_type.lower() not in (primitives_int + primitives_char + ["bool"]):
-                # 处理 C++ 命名空间
                 if "::" in core_type:
                     category = core_type.split("::")[-1]
                 else:
                     category = core_type
-
-                # 清洗非合法字符
                 category = re.sub(r'\W+', '', category)
-
-                # 数字防崩溃拦截
                 if not category or category.isdigit():
                     category = "obj"
                 elif category[0].isdigit():
                     category = "v" + category
             else:
-                # 基础类型逻辑
                 if is_pointer:
                     category = "pointer"
                 elif core_type.lower() in primitives_char:
@@ -546,19 +498,14 @@ class HeavyWeightCandidateGenerator:
                 else:
                     category = "int"
 
-        # --- 3. 获取 MLM 预测词并拼接 ---
         code_str = code if isinstance(code, str) else code.decode('utf-8')
         candidate_words = self.get_top_mlm_words(code_str.encode(), target_name)
 
-        # 4. 筛选一个未被使用的词
         for w in candidate_words:
-            # 过滤掉非法的变量名字符
             w = re.sub(r'\W+', '', w)
             if not w: continue
-
             potential_name = f"{category}_{w}"
             if potential_name not in excluded_names:
                 return potential_name
 
-        # 5. 如果都冲突了，加数字后缀兜底
         return f"{category}_{len(excluded_names)}"

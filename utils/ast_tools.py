@@ -5,6 +5,7 @@ from tree_sitter import Language, Parser
 
 class IdentifierAnalyzer:
     def __init__(self, lang="cpp"):
+        """Initializes the AST parser and sets up reserved keywords for the specified language."""
         if lang == "c":
             from tree_sitter_c import language as ts_c
             self.language = Language(ts_c())
@@ -13,9 +14,6 @@ class IdentifierAnalyzer:
             self.language = Language(ts_cpp())
         else:
             raise ValueError("Unsupported language. Choose 'c' or 'cpp'.")
-
-        # self.parser = Parser()
-        # self.parser.language = self.language
 
         self.keywords = {
             "int", "char", "float", "double", "void", "if", "else", "for", "while", "return",
@@ -33,6 +31,7 @@ class IdentifierAnalyzer:
         }
 
     def extract_identifiers(self, source_code: bytes) -> dict:
+        """Traverses the AST to extract non-keyword identifiers and their scope information."""
         parser = Parser()
         parser.language = self.language
         tree = parser.parse(source_code)
@@ -61,12 +60,12 @@ class IdentifierAnalyzer:
             'preproc_function_def',
             'type_identifier',
             'template_type',
-            'namespace_identifier'  # 排除 namespace 名字本身
+            'namespace_identifier'
         }
 
         forbidden_node_types = {
-            'destructor_name',  # ~MyClass
-            'operator_name'  # operator+
+            'destructor_name',
+            'operator_name'
         }
 
         def traverse(node):
@@ -99,8 +98,6 @@ class IdentifierAnalyzer:
                     pass
                 elif name not in self.keywords and parent_type not in excluded_parents:
 
-                    # 1. 精准判断是否为函数/方法声明
-                    # (由于指针或引用，function_declarator 可能会被包几层，我们需要向上穿透)
                     is_func_decl = False
                     curr = node.parent
                     while curr and curr.type in ['qualified_identifier', 'pointer_declarator', 'reference_declarator',
@@ -111,7 +108,6 @@ class IdentifierAnalyzer:
 
                     is_constructor = False
 
-                    # 2. 检查类外定义的构造函数 (例如 DataProcessor::DataProcessor)
                     if node.parent and node.parent.type == "qualified_identifier":
                         scope_node = node.parent.child_by_field_name('scope')
                         name_node = node.parent.child_by_field_name('name')
@@ -121,7 +117,6 @@ class IdentifierAnalyzer:
                             if scope_basename == name:
                                 is_constructor = True
 
-                    # 3. 检查类内定义的构造函数
                     if is_func_decl and not is_constructor:
                         for scope in reversed(scope_stack):
                             if scope["type"] in ['class_specifier', 'struct_specifier']:
@@ -129,7 +124,6 @@ class IdentifierAnalyzer:
                                     is_constructor = True
                                 break
 
-                    # 4. 判断调用类型
                     is_method_call = (
                             node.type == "field_identifier" and
                             node.parent and node.parent.type == "field_expression" and
@@ -143,8 +137,6 @@ class IdentifierAnalyzer:
 
                     entity_type = "function" if (is_func_decl or is_func_call or is_method_call) else "variable"
 
-                    # 5. 【关键修复】如果是 field_identifier，它必须是方法声明或方法调用，才放行。
-                    # 如果不是声明也不是方法调用，说明它是纯粹的类成员变量，为了安全保持不触碰。
                     is_plain_field = (node.type == "field_identifier" and not is_method_call and not is_func_decl)
 
                     if not is_constructor and not is_plain_field:
@@ -168,6 +160,7 @@ class IdentifierAnalyzer:
         return dict(identifiers)
 
     def get_identifier_scope_ranges(self, source_code: bytes, var_name: str):
+        """Returns a list of start and end byte ranges defining the scope of a given identifier."""
         identifiers = self.extract_identifiers(source_code)
         if var_name not in identifiers:
             return []
@@ -179,11 +172,13 @@ class IdentifierAnalyzer:
 
     @staticmethod
     def scopes_overlap(scope_a, scope_b) -> bool:
+        """Checks if two distinct scope ranges overlap with one another."""
         a_start, a_end = scope_a
         b_start, b_end = scope_b
         return not (a_end <= b_start or b_end <= a_start)
 
     def can_rename_to(self, source_code: bytes, old_name: str, new_name: str) -> bool:
+        """Determines if an identifier can be safely renamed without causing scope collisions."""
         identifiers = self.extract_identifiers(source_code)
 
         if old_name == new_name:
@@ -203,7 +198,7 @@ class IdentifierAnalyzer:
         return True
 
     def analyze_format(self, name: str) -> dict:
-        # 1. 提取前缀 (如 _ 或 __)
+        """Analyzes an identifier to determine its naming convention and structure."""
         prefix_match = re.match(r'^_+', name)
         prefix = prefix_match.group(0) if prefix_match else ""
         pure_name = name[len(prefix):]
@@ -211,13 +206,10 @@ class IdentifierAnalyzer:
         if not pure_name:
             return {"prefix": prefix, "lengths": [], "style": "special", "count": 0}
 
-        # 2. 判定风格：只要有下划线，就是 snake_case
         if '_' in pure_name:
             style = "snake_case"
-            # 严格按下划线拆分，不关心单词内部是否有大写
             words = pure_name.split('_')
         else:
-            # 没有下划线，才尝试按驼峰拆分
             words = re.findall(r'[A-Z]?[a-z0-9]+|[A-Z]+(?=[A-Z][a-z0-9]|\b)', pure_name)
             if pure_name[0].isupper():
                 style = "PascalCase"
@@ -233,6 +225,7 @@ class IdentifierAnalyzer:
 
 
 def is_valid_identifier(name: str) -> bool:
+    """Validates if a string follows standard C/C++ identifier naming rules."""
     pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
     return bool(re.match(pattern, name))
 
@@ -240,17 +233,18 @@ def is_valid_identifier(name: str) -> bool:
 class CodeTransformer:
     @staticmethod
     def validate_and_apply(source_code: bytes, identifiers: dict, renaming_map: dict, analyzer=None) -> str:
+        """Validates renaming rules and securely applies the substitutions to the code bytearray."""
         for old_name, new_name in renaming_map.items():
             if not is_valid_identifier(new_name):
-                raise ValueError(f"命名不合法: '{new_name}'")
+                raise ValueError(f"Invalid naming: '{new_name}'")
 
             if analyzer is not None:
                 if not analyzer.can_rename_to(source_code, old_name, new_name):
-                    raise ValueError(f"作用域冲突: '{old_name}' -> '{new_name}' 不可用。")
+                    raise ValueError(f"Scope conflict: '{old_name}' -> '{new_name}' is unavailable.")
             else:
                 existing_names = set(identifiers.keys())
                 if new_name in existing_names and new_name != old_name:
-                    raise ValueError(f"重命名冲突: '{old_name}' -> '{new_name}' 已存在。")
+                    raise ValueError(f"Renaming conflict: '{old_name}' -> '{new_name}' already exists.")
 
         code = bytearray(source_code)
         replacements = []
@@ -259,7 +253,6 @@ class CodeTransformer:
                 for pos in identifiers[old_name]:
                     replacements.append((pos['start'], pos['end'], new_name))
 
-        # 从后往前替换，防止偏移量变化导致位置错误
         replacements.sort(key=lambda x: x[0], reverse=True)
         for start, end, new_name in replacements:
             code[start:end] = new_name.encode("utf-8")

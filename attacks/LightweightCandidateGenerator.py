@@ -1,8 +1,3 @@
-"""
-轻量级候选词生成器
-使用预训练的 FastText 词向量 + FAISS 索引实现 O(1) 语义近邻检索。
-"""
-
 import json
 import logging
 import random
@@ -19,23 +14,20 @@ try:
     import faiss
     _FAISS_AVAILABLE = True
 except ImportError:
-    logger.warning("faiss 未安装，候选生成将退化为随机替换")
+    logger.warning("faiss not installed; falling back to random substitution.")
 
 try:
     import fasttext
     _FT_AVAILABLE = True
 except ImportError:
-    logger.warning("fasttext 未安装，候选生成将退化为随机替换")
+    logger.warning("fasttext not installed; falling back to random substitution.")
 
 from utils.ast_tools import IdentifierAnalyzer
 
 
 class LightweightCandidateGenerator:
-    """
-    S(v_i) = FAISS.top_M( E_ft(v_i) )
-    """
-
     def __init__(self, config):
+        """Initializes the generator by loading FastText and FAISS models for semantic search."""
         self.config = config.get("lightweight_candidate", {})
         self.top_m = self.config.get("top_m", 10)
 
@@ -44,16 +36,14 @@ class LightweightCandidateGenerator:
         self.vocab = []
         self.analyzer = IdentifierAnalyzer()
 
-        # 加载 FastText
         ft_path = self.config.get("fasttext_model_path", "")
         if _FT_AVAILABLE and ft_path:
             try:
                 self.ft_model = fasttext.load_model(ft_path)
-                logger.info(f"FastText 模型加载成功: {ft_path}")
+                logger.info(f"FastText model loaded successfully: {ft_path}")
             except Exception as e:
-                logger.warning(f"FastText 加载失败: {e}")
+                logger.warning(f"Failed to load FastText: {e}")
 
-        # 加载 FAISS 索引 + 词表
         faiss_path = self.config.get("faiss_index_path", "")
         vocab_path = self.config.get("faiss_vocab_path", "")
         if _FAISS_AVAILABLE and faiss_path:
@@ -61,11 +51,10 @@ class LightweightCandidateGenerator:
                 self.faiss_index = faiss.read_index(faiss_path)
                 with open(vocab_path, "r", encoding="utf-8") as f:
                     self.vocab = json.load(f)
-                logger.info(f"FAISS 索引加载成功: {faiss_path}, 词表大小: {len(self.vocab)}")
+                logger.info(f"FAISS index loaded successfully: {faiss_path}, vocab size: {len(self.vocab)}")
             except Exception as e:
-                logger.warning(f"FAISS 加载失败: {e}")
+                logger.warning(f"Failed to load FAISS: {e}")
 
-        # 退化用的随机变量名池
         self._fallback_pool = [
             f"var_{i}" for i in range(200)
         ] + [
@@ -75,12 +64,11 @@ class LightweightCandidateGenerator:
         ]
 
     def _get_faiss_neighbors(self, word: str) -> List[str]:
-        """通过 FAISS 查找语义最近的 M 个候选替换词"""
+        """Retrieves semantically similar candidates from the FAISS index."""
         if self.ft_model is None or self.faiss_index is None:
             return []
 
         vec = self.ft_model.get_word_vector(word).astype(np.float32).reshape(1, -1)
-        # L2 归一化 (余弦相似度)
         faiss.normalize_L2(vec)
         _, indices = self.faiss_index.search(vec, self.top_m + 1)
 
@@ -93,15 +81,12 @@ class LightweightCandidateGenerator:
         return candidates[: self.top_m]
 
     def _fallback_candidates(self, word: str) -> List[str]:
-        """退化: 随机生成候选词"""
+        """Provides a random set of fallback identifiers when semantic search fails."""
         pool = [w for w in self._fallback_pool if w != word]
         return random.sample(pool, min(self.top_m, len(pool)))
 
     def generate_candidates(self, code: str) -> Dict[str, List[str]]:
-        """
-        给定一段代码，返回每个标识符的候选替换词集合。
-        返回: { identifier: [candidate_1, ..., candidate_M], ... }
-        """
+        """Maps each identifier in the provided code to a list of potential replacement candidates."""
         code_bytes = code.encode("utf-8") if isinstance(code, str) else code
         identifiers = self.analyzer.extract_identifiers(code_bytes)
 
@@ -115,10 +100,7 @@ class LightweightCandidateGenerator:
         return result
 
     def get_random_replacement(self, code: str, target_vars: List[str]) -> Dict[str, str]:
-        """
-        为指定的变量列表各随机选一个替换词。
-        用于随机平滑(Randomized Smoothing)和安全样本增强。
-        """
+        """Selects a single random substitution for each specified target variable."""
         candidates = self.generate_candidates(code)
         mapping = {}
         for var in target_vars:

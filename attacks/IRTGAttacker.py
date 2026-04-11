@@ -8,12 +8,12 @@ from utils.model_zoo import ModelZoo
 
 class IRTGAttacker:
     def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, mode: str, config: dict):
+        """Initializes the attacker with model environments, function pointers, and configuration parameters."""
         self.model_zoo = model_zoo
         self.model_names = model_zoo.model_names
         self.mode = mode
         self.config = config
 
-        # --- 从 config 中提取参数 ---
         run_params = config.get('run_params', {})
         irtg_config = config.get('irtg_attacker', {})
         global_config = config.get('global', {})
@@ -22,7 +22,7 @@ class IRTGAttacker:
         self.iterations = run_params.get('iterations', 10)
         self.run_mode = run_params.get('run_mode', 'attack')
         self.optimizer_type = run_params.get('algorithm', 'greedy').lower()
-        self.result_dir = global_config.get('result_dir', './results')  # 动态读取保存目录
+        self.result_dir = global_config.get('result_dir', './results')
 
         self.attacker_params = {
             "get_all_vars_fn": get_all_vars_fn,
@@ -31,24 +31,22 @@ class IRTGAttacker:
         }
 
     def attack(self, dataset: List[Dict]):
+        """Executes the attack pipeline across the dataset and calculates the cross-model transferability matrix."""
         stats = {atk: {vic: {"total": 0, "fooled": 0} for vic in self.model_names}
                  for atk in self.model_names}
 
-        # 存储容器
         storage_orig = {m: [] for m in self.model_names}
         storage_adv = {m: [] for m in self.model_names}
 
-        # 只有在使用非贪心搜索（GA）时，才真正需要用到 rankers
         rankers = {m: RNNS_Ranker(self.model_zoo, m, self.attacker_params["rename_fn"]) for m in self.model_names}
 
-        # 3. 根据指定的 optimizer_type 选择优化器类
         optimizers = {}
         for m in self.model_names:
             if self.optimizer_type == "greedy":
                 optimizers[m] = GreedyOptimizer(
                     self.model_zoo, m, self.attacker_params["rename_fn"],
                     mode=self.mode,
-                    config=self.config  # 确保你把整个 config 传进去了
+                    config=self.config
                 )
             else:
                 optimizers[m] = GeneticAlgorithmOptimizer(
@@ -81,17 +79,13 @@ class IRTGAttacker:
             for atk_model in self.model_names:
                 orig_pred = orig_predictions[atk_model]["pred"]
 
-                # 4. 打印当前使用的模式
-                print(
-                    f"\n[Sample {idx + 1}] Target={atk_model} | Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)...")
+                print(f"\n[Sample {idx + 1}] Target={atk_model} | Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)...")
                 stats[atk_model][atk_model]["total"] += 1
 
                 if self.optimizer_type == "greedy":
-                    # 贪心模式：跳过预处理，全量变量直接交给 Greedy 跑
                     target_vars = variables.copy()
                     target_scores = None
                 else:
-                    # GA 模式：必须跑 RNNS 缩小搜索空间并获取分数作为突变权重
                     print("RNNS-Start...")
                     ranked_vars, all_scores = rankers[atk_model].rank_variables(
                         code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred,
@@ -100,14 +94,12 @@ class IRTGAttacker:
                     target_vars = ranked_vars
                     target_scores = {var: all_scores[var] for var in target_vars}
 
-                # 5. 调用统一命名的 optimizers 字典，打印日志自适应
                 print(f"{self.optimizer_type.upper()}-Start...")
                 is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(
                     code=code, original_pred=orig_pred, target_vars=target_vars,
                     subs_pool=subs_pool, variable_scores=target_scores
                 )
 
-                # --- 存储逻辑 ---
                 if self.run_mode == "dataset":
                     storage_orig[atk_model].append({"func": code, "label": ground_truth})
                     storage_adv[atk_model].append({"func": adv_code, "label": ground_truth})
@@ -154,7 +146,7 @@ class IRTGAttacker:
         return asr_matrix
 
     def save_results(self, storage_orig, storage_adv):
-        # 使用从 config 读取的路径
+        """Saves original and adversarial samples to JSON files based on the configured result directory."""
         result_dir = self.result_dir
         if not os.path.exists(result_dir):
             os.makedirs(result_dir)
@@ -177,14 +169,16 @@ class IRTGAttacker:
                     self._write_json(file_path, storage_adv[model])
 
     def _write_json(self, filename, data):
+        """Handles the standard JSON serialization and file writing process for sample results."""
         try:
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
-            print(f"[INFO] 已保存 {len(data)} 个样本至: {filename}")
+            print(f"[INFO] Saved {len(data)} samples to: {filename}")
         except Exception as e:
-            print(f"[ERROR] 保存 {filename} 失败: {e}")
+            print(f"[ERROR] Failed to save {filename}: {e}")
 
     def print_summary(self, stats):
+        """Prints a formatted matrix displaying the Attack Success Rate (ASR) across all target and victim models."""
         print("\n" + "=" * 90)
         print("📊 FINAL CROSS-MODEL TRANSFERABILITY MATRIX (ASR %)")
         print("=" * 90)

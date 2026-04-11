@@ -1,4 +1,5 @@
 import random
+import math
 
 class GeneticAlgorithmOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
@@ -19,6 +20,7 @@ class GeneticAlgorithmOptimizer:
         self.m_rate_max = ga_cfg.get('mutation_rate_max', 0.5)
 
     def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
+        """Executes a genetic algorithm to find the optimal adversarial variable substitutions."""
         mutation_probs = {}
         if variable_scores and target_vars:
             scores = [variable_scores.get(v, 0) for v in target_vars]
@@ -144,10 +146,6 @@ class GeneticAlgorithmOptimizer:
         return (best_pred != original_pred), best_code, best_probs, best_pred
 
 
-import math
-
-
-
 class GreedyOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
         self.model_zoo = model_zoo
@@ -159,6 +157,7 @@ class GreedyOptimizer:
         self.run_mode = run_cfg.get('run_mode', 'attack')
 
     def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
+        """Executes a sequential greedy search to apply variable substitutions and bypass model defenses."""
         if variable_scores:
             sorted_vars = sorted(target_vars, key=lambda v: variable_scores.get(v, 0), reverse=True)
         else:
@@ -175,9 +174,6 @@ class GreedyOptimizer:
             if not candidates:
                 continue
 
-            # ========================================================
-            # 优化 1: 移除无意义的线程池，直接顺序生成候选代码（大幅减少 CPU 开销）
-            # ========================================================
             codes_to_predict = []
             for cand in candidates:
                 if cand == var:
@@ -194,10 +190,6 @@ class GreedyOptimizer:
 
             candidate_strings = [item[1] for item in codes_to_predict]
 
-            # ========================================================
-            # 优化 2: 搜索阶段使用 _base_batch_predict (不触发平滑采样)
-            # 使用底层模型梯度的近似方向进行贪心选择，避免 N 倍的推理开销
-            # ========================================================
             batch_probs, batch_preds = self.model_zoo._base_batch_predict(candidate_strings, self.target_model)
 
             best_var_fitness = float('-inf')
@@ -223,7 +215,6 @@ class GreedyOptimizer:
                     best_var_probs = probs
                     best_var_pred = pred
 
-            # 接受当前变量的最佳替换
             if best_var_code and best_var_fitness > float('-inf'):
                 current_code = best_var_code
                 current_best_probs = best_var_probs
@@ -233,24 +224,14 @@ class GreedyOptimizer:
                     overall_best_fitness = best_var_fitness
                     overall_best_code = best_var_code
 
-                # ========================================================
-                # 优化 3: 只有在底层模型上成功 Flip 时，才触发一次带有多数表决的真实预测
-                # 验证这个攻击样本是否足以击穿平滑防御
-                # ========================================================
                 if current_best_pred != original_pred and self.run_mode == "attack":
-
-                    # 进行一次真实的防守对抗校验
                     verify_probs, verify_pred = self.model_zoo.predict(current_code, self.target_model)
 
                     if verify_pred != original_pred:
-                        # 成功击穿防御
                         return True, current_code, verify_probs, verify_pred
                     else:
-                        # 底层模型被骗过了，但是被平滑防御拦截了。
-                        # 这里可以选择回退代码，或者继续在这个基础上替换其他变量（建议继续，以累积对抗扰动）
-                        current_best_pred = verify_pred  # 将预测结果修正回原标签，让循环继续去替换下一个变量
+                        current_best_pred = verify_pred
 
-        # 循环结束，做最后一次校验
         final_probs, final_pred = self.model_zoo.predict(overall_best_code, self.target_model)
         is_success = (final_pred != original_pred)
 
