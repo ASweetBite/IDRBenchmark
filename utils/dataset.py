@@ -1,6 +1,6 @@
 import pandas as pd
 import os
-import json # [新增]
+import json
 from typing import List, Dict, Optional
 from sklearn.preprocessing import LabelEncoder
 
@@ -11,11 +11,15 @@ class DatasetLoader:
         self.label_map = {}
         self.mode = "binary"  # 默认为二分类
 
+        self.safe_flags = [
+            "", "none", "0", "safe", "nan", "null", "false",
+            "<null>", "<na>"
+        ]
+
     def load_parquet_dataset(self, filepath: str, mode: str = "binary", max_samples: int = None,
                              random_seed: int = 50, label_map_path: Optional[str] = None) -> List[Dict]:
         """
-        加载数据，支持随机采样和标签映射。
-        - label_map_path: [新增] json 文件路径。如果存在则读取并强制映射；如果不存在则基于当前数据生成并保存。
+        加载数据，支持随机采样、标签映射与数据清洗。
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Dataset file not found: {filepath}")
@@ -28,11 +32,30 @@ class DatasetLoader:
         if 'func' not in df.columns or 'cwe' not in df.columns:
             raise ValueError("Parquet file must contain 'func' and 'cwe' columns.")
 
+        # ========================================================
+        # [新增核心过滤 1]：基础代码过滤 (过滤掉单行或空代码)
+        # ========================================================
+        def _line_count(s):
+            return len([l for l in str(s).splitlines() if l.strip()])
+
+        initial_count = len(df)
+        df = df[df["func"].apply(_line_count) > 1].copy()
+
+        # 统一转为字符串并去除首尾空格
+        df["cwe"] = df["cwe"].fillna("").astype(str).str.strip()
+
+        print(f"[*] 数据清洗: 过滤了 {initial_count - len(df)} 条单行或空代码，剩余 {len(df)} 条有效样本。")
+        # ========================================================
+
         processed_data = []
 
         # 2. 标签处理
         if self.mode == "binary":
-            df['label'] = df['cwe'].apply(lambda x: 0 if (not x or x == "") else 1)
+            # ========================================================
+            # [新增核心过滤 2]：使用严谨的 safe_flags 判断
+            # ========================================================
+            df['label'] = df['cwe'].apply(lambda x: 0 if str(x).lower() in self.safe_flags else 1)
+
             safe_df = df[df['label'] == 0]
             vuln_df = df[df['label'] == 1]
 
@@ -57,18 +80,23 @@ class DatasetLoader:
             self.label_map = {0: "Safe", 1: "Vulnerable"}
 
         elif self.mode == "multi":
-            df['label_raw'] = df['cwe'].apply(lambda x: "Safe" if (not x or x == "") else x)
+            # [新增核心过滤 2]：同样应用于 Multi 模式
+            df['label_raw'] = df['cwe'].apply(lambda x: "Safe" if str(x).lower() in self.safe_flags else x)
 
-            # ========================================================
-            # [核心修改]：Multi 模式的 JSON 读取与保存逻辑
-            # ========================================================
             if label_map_path and os.path.exists(label_map_path):
                 # A. 存在预定义映射表：读取并强制对齐
                 print(f"[*] Loading existing label map from {label_map_path}...")
                 with open(label_map_path, 'r', encoding='utf-8') as f:
-                    loaded_map = json.load(f)
-                    # 注意：JSON 序列化时 key 都会变成 string，加载时需要转回 int
-                    self.label_map = {int(k): v for k, v in loaded_map.items()}
+                    loaded_data = json.load(f)
+
+                    # 兼容 Hugging Face 的标准格式 (带有 "id2label" 嵌套)
+                    if "id2label" in loaded_data:
+                        raw_map = loaded_data["id2label"]
+                    else:
+                        # 兼容普通的扁平 JSON 格式
+                        raw_map = loaded_data
+
+                    self.label_map = {int(k): v for k, v in raw_map.items()}
 
                 # 构建反向映射表 {CWE: ID}
                 cwe_to_id = {v: k for k, v in self.label_map.items()}
@@ -92,12 +120,15 @@ class DatasetLoader:
 
                 # 如果传入了路径，将其保存为 JSON
                 if label_map_path:
-                    # 确保保存的目录存在
                     os.makedirs(os.path.dirname(label_map_path) or '.', exist_ok=True)
                     with open(label_map_path, 'w', encoding='utf-8') as f:
-                        json.dump(self.label_map, f, indent=4, ensure_ascii=False)
+                        # 统一保存为标准的 Hugging Face 嵌套格式，保持生态一致性
+                        save_data = {
+                            "id2label": self.label_map,
+                            "label2id": {v: k for k, v in self.label_map.items()}
+                        }
+                        json.dump(save_data, f, indent=4, ensure_ascii=False)
                     print(f"[*] Saved new label map to {label_map_path}")
-            # ========================================================
 
             # 多分类的随机采样
             if max_samples and max_samples < len(df):
@@ -111,7 +142,7 @@ class DatasetLoader:
             processed_data.append({
                 "code": row["func"],
                 "label": int(row["label"]),
-                "raw_cwe": row["cwe"]
+                "raw_cwe": row["cwe"]  # 这里的 cwe 是清理过后的字符串
             })
 
         print(f"[*] Successfully processed {len(processed_data)} samples.")

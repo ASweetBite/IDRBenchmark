@@ -1,9 +1,4 @@
-import concurrent.futures
-import concurrent.futures
 import random
-
-from utils.model_zoo import ModelZoo
-
 
 class GeneticAlgorithmOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
@@ -12,15 +7,12 @@ class GeneticAlgorithmOptimizer:
         self.rename_fn = rename_fn
         self.mode = mode
 
-        # 从配置文件读取 GA 专属参数
         ga_cfg = config.get('genetic_algorithm', {})
         run_cfg = config.get('run_params', {})
-        glob_cfg = config.get('global', {})
 
         self.pop_size = ga_cfg.get('pop_size', 40)
         self.max_generations = run_cfg.get('iterations', 60)
         self.run_mode = run_cfg.get('run_mode', 'attack')
-        self.max_workers = glob_cfg.get('max_workers', 8)
 
         self.stagnation_limit = ga_cfg.get('stagnation_threshold', 5)
         self.m_rate_min = ga_cfg.get('mutation_rate_min', 0.1)
@@ -64,20 +56,13 @@ class GeneticAlgorithmOptimizer:
 
             previous_best_fitness = best_fitness
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_key = {}
-                for ind in population:
-                    rename_map = {k: v for k, v in ind.items() if k != v}
-                    cache_key = frozenset(rename_map.items())
+            for ind in population:
+                rename_map = {k: v for k, v in ind.items() if k != v}
+                cache_key = frozenset(rename_map.items())
 
-                    if cache_key not in fitness_cache:
-                        future = executor.submit(self.rename_fn, code, rename_map)
-                        future_to_key[future] = cache_key
-
-                for future in concurrent.futures.as_completed(future_to_key):
-                    cache_key = future_to_key[future]
+                if cache_key not in fitness_cache:
                     try:
-                        mutated_code = future.result()
+                        mutated_code = self.rename_fn(code, rename_map)
                         codes_to_predict.append(mutated_code)
                         keys_to_predict.append(cache_key)
                     except Exception:
@@ -91,19 +76,12 @@ class GeneticAlgorithmOptimizer:
 
                     orig_prob = max(probs[original_pred], 1e-9)
 
-                    # ========================================================
-                    # [修改点 2]：根据 mode 计算适应度
-                    # ========================================================
                     if self.mode == "binary":
                         target_label = 1 - original_pred
                         target_prob = max(probs[target_label], 1e-9)
-                        # 二分类：最大化对立标签概率相对于原始标签的对数几率
                         fitness = math.log(target_prob) - math.log(orig_prob)
                     else:
-                        # 细分模型：纯粹为了拉低原始标签的概率。
-                        # 因为我们要最大化 fitness，所以取 -orig_prob。概率越低，适应度越高。
                         fitness = -orig_prob
-                    # ========================================================
 
                     fitness_cache[keys_to_predict[i]] = (fitness, pred, codes_to_predict[i], probs)
 
@@ -167,8 +145,8 @@ class GeneticAlgorithmOptimizer:
 
 
 import math
-import concurrent.futures
-from utils.model_zoo import ModelZoo
+
+
 
 class GreedyOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
@@ -178,10 +156,7 @@ class GreedyOptimizer:
         self.mode = mode
 
         run_cfg = config.get('run_params', {})
-        glob_cfg = config.get('global', {})
-
         self.run_mode = run_cfg.get('run_mode', 'attack')
-        self.max_workers = glob_cfg.get('max_workers', 8)
 
     def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
         if variable_scores:
@@ -200,28 +175,30 @@ class GreedyOptimizer:
             if not candidates:
                 continue
 
+            # ========================================================
+            # 优化 1: 移除无意义的线程池，直接顺序生成候选代码（大幅减少 CPU 开销）
+            # ========================================================
             codes_to_predict = []
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_cand = {}
-                for cand in candidates:
-                    if cand == var: continue
-                    future = executor.submit(self.rename_fn, current_code, {var: cand})
-                    future_to_cand[future] = cand
-
-                for future in concurrent.futures.as_completed(future_to_cand):
-                    cand = future_to_cand[future]
-                    try:
-                        temp_code = future.result()
+            for cand in candidates:
+                if cand == var:
+                    continue
+                try:
+                    temp_code = self.rename_fn(current_code, {var: cand})
+                    if temp_code:
                         codes_to_predict.append((cand, temp_code))
-                    except Exception:
-                        continue
+                except Exception:
+                    continue
 
             if not codes_to_predict:
                 continue
 
             candidate_strings = [item[1] for item in codes_to_predict]
-            batch_probs, batch_preds = self.model_zoo.batch_predict(candidate_strings, self.target_model)
+
+            # ========================================================
+            # 优化 2: 搜索阶段使用 _base_batch_predict (不触发平滑采样)
+            # 使用底层模型梯度的近似方向进行贪心选择，避免 N 倍的推理开销
+            # ========================================================
+            batch_probs, batch_preds = self.model_zoo._base_batch_predict(candidate_strings, self.target_model)
 
             best_var_fitness = float('-inf')
             best_var_code = None
@@ -231,20 +208,14 @@ class GreedyOptimizer:
             for i in range(len(codes_to_predict)):
                 probs = batch_probs[i]
                 pred = batch_preds[i]
-
                 orig_prob = max(probs[original_pred], 1e-9)
 
-                # ========================================================
-                # [修改点 4]：根据 mode 计算适应度
-                # ========================================================
                 if self.mode == "binary":
                     target_label = 1 - original_pred
                     target_prob = max(probs[target_label], 1e-9)
                     fitness = math.log(target_prob) - math.log(orig_prob)
                 else:
-                    # 细分模型策略：压低原置信度
                     fitness = -orig_prob
-                # ========================================================
 
                 if fitness > best_var_fitness:
                     best_var_fitness = fitness
@@ -252,6 +223,7 @@ class GreedyOptimizer:
                     best_var_probs = probs
                     best_var_pred = pred
 
+            # 接受当前变量的最佳替换
             if best_var_code and best_var_fitness > float('-inf'):
                 current_code = best_var_code
                 current_best_probs = best_var_probs
@@ -261,7 +233,25 @@ class GreedyOptimizer:
                     overall_best_fitness = best_var_fitness
                     overall_best_code = best_var_code
 
+                # ========================================================
+                # 优化 3: 只有在底层模型上成功 Flip 时，才触发一次带有多数表决的真实预测
+                # 验证这个攻击样本是否足以击穿平滑防御
+                # ========================================================
                 if current_best_pred != original_pred and self.run_mode == "attack":
-                    return True, current_code, current_best_probs, current_best_pred
 
-        return (current_best_pred != original_pred), overall_best_code, current_best_probs, current_best_pred
+                    # 进行一次真实的防守对抗校验
+                    verify_probs, verify_pred = self.model_zoo.predict(current_code, self.target_model)
+
+                    if verify_pred != original_pred:
+                        # 成功击穿防御
+                        return True, current_code, verify_probs, verify_pred
+                    else:
+                        # 底层模型被骗过了，但是被平滑防御拦截了。
+                        # 这里可以选择回退代码，或者继续在这个基础上替换其他变量（建议继续，以累积对抗扰动）
+                        current_best_pred = verify_pred  # 将预测结果修正回原标签，让循环继续去替换下一个变量
+
+        # 循环结束，做最后一次校验
+        final_probs, final_pred = self.model_zoo.predict(overall_best_code, self.target_model)
+        is_success = (final_pred != original_pred)
+
+        return is_success, overall_best_code, final_probs, final_pred

@@ -145,16 +145,13 @@ class HeavyWeightCandidateGenerator:
         except Exception:
             return None
 
-    # [优化] 重构校验通道：支持批量矩阵相似度计算和多线程 AST 验证
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
-        # 1. 基础硬性规则过滤 (最快，优先剔除)
         filtered_cands = []
         for cand in candidate_list:
             if cand in ctx['keywords'] or cand == ctx['target_name']: continue
             if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
             filtered_cands.append(cand)
 
-        # 2. 批量语义校验 (矩阵计算代替 for 循环)
         semantically_valid = []
         if not is_full_context and ctx['semantic_threshold'] > 0 and ctx['original_emb'] is not None:
             cand_embs = []
@@ -166,11 +163,9 @@ class HeavyWeightCandidateGenerator:
                     valid_cands_temp.append(cand)
 
             if cand_embs:
-                # 将列表堆叠为矩阵 [N, hidden_size] 并移至同一设备
                 cand_tensor = torch.stack(cand_embs).to(ctx['original_emb'].device)
                 orig_tensor = ctx['original_emb'].unsqueeze(0)  # [1, hidden_size]
 
-                # 一次性算出所有候选词的相似度
                 sims = F.cosine_similarity(orig_tensor, cand_tensor)
 
                 for cand, sim in zip(valid_cands_temp, sims):
@@ -179,28 +174,18 @@ class HeavyWeightCandidateGenerator:
         else:
             semantically_valid = filtered_cands
 
-        # 3. 多线程 AST 物理冲突校验 (解决 CPU 串行阻塞)
-        added = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            # 提交并行的 AST 验证任务
-            future_to_cand = {
-                executor.submit(self._verify_ast_single, cand, ctx): cand
-                for cand in semantically_valid
-            }
-
-            # as_completed 谁先完成处理谁
-            for future in concurrent.futures.as_completed(future_to_cand):
+            added = 0
+            for cand in semantically_valid:
                 if added >= quota:
-                    # 如果配额已满，可以直接取消后续尚未开始的任务
-                    for f in future_to_cand: f.cancel()
                     break
 
-                cand = future.result()
-                if cand and cand not in final_candidates:
-                    final_candidates.append(cand)
+                valid_cand = self._verify_ast_single(cand, ctx)
+
+                if valid_cand and valid_cand not in final_candidates:
+                    final_candidates.append(valid_cand)
                     added += 1
 
-        return added
+            return added
 
     def _generate_core(self, code: str, target_name: str, identifiers: dict,
                        top_k_mlm: int, top_n_keep: int, semantic_threshold: float,

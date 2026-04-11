@@ -1,7 +1,7 @@
 import argparse
 import concurrent.futures
 import random
-import yaml  # 新增 yaml 依赖
+import yaml
 
 import numpy as np
 import torch

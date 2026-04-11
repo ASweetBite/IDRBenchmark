@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 1. 独立抽离的平滑器组件 (作为 ModelZoo 的内部模块)
+# 1. 独立抽离的平滑器组件 (保持不变)
 # ==========================================
 class CodeSmoother:
     def __init__(self, config: Dict, candidate_generator):
@@ -42,7 +42,6 @@ class CodeSmoother:
 
         samples = []
         for _ in range(self.num_samples):
-            # 确定要替换的标识符 (靶向 or 随机)
             if sensitive_vars:
                 targets = [v for v in identifiers if v in sensitive_vars and random.random() < self.replace_prob]
             else:
@@ -84,6 +83,9 @@ class ModelZoo:
         self.num_classes = run_cfg.get('num_classes', 16)
         self.max_seq_len = run_cfg.get('max_seq_len', 512)
 
+        # 新增：从 config 中读取是否开启多数表决预测的开关
+        self.use_majority_voting = run_cfg.get('use_majority_voting', False)
+
         self.models = {}
         self.model_names = list(model_configs.keys())
         self.smoother = smoother  # 已注入的平滑器
@@ -99,7 +101,6 @@ class ModelZoo:
                 # 检查是否是双头模型
                 if os.path.exists(os.path.join(path, "dual_heads.pt")):
                     print(f"[*] 检测到双头模型，正在初始化加载器...")
-                    # 动态构建 loader 配置
                     loader_cfg = {
                         "model": {
                             "model_name": path,
@@ -121,28 +122,23 @@ class ModelZoo:
             except Exception as e:
                 print(f"[!] Error loading {name}: {e}")
 
-    def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
+    # ================= 核心底层推理逻辑 =================
+    def _base_predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
+        """最底层的单条推理逻辑（不包含平滑和投票）"""
         m = self.models.get(target_model)
         if m is None:
             return [0.5, 0.5], 0
 
-        # ========== 处理双头模型 ==========
         if m["type"] == "dual_head":
             res = m["model_obj"].predict(code)
-
             if self.eval_mode == "binary":
-                # f_det 是漏洞类别(1类)的概率。我们需要补齐 Safe(0类) 的概率以对齐接口
                 p_vuln = res["f_det"]
                 probs = [1.0 - p_vuln, p_vuln]
                 pred_label = 1 if p_vuln > 0.5 else 0
             else:
-                # 多分类模式，直接返回所有的类别概率
                 probs = res["f_cls"]
                 pred_label = int(np.argmax(probs))
-
             return probs, pred_label
-
-        # ========== 处理标准模型 ==========
         else:
             inputs = m["tokenizer"](
                 code, return_tensors="pt", truncation=True, max_length=512, padding="max_length"
@@ -154,40 +150,27 @@ class ModelZoo:
                 pred_label = int(np.argmax(probs))
             return probs, pred_label
 
-    def predict_label_conf(self, code: str, label: int, target_model: str) -> float:
-        probs, _ = self.predict(code, target_model)
-        # 防止因模型错误导致数组越界
-        if label < len(probs):
-            return probs[label]
-        return 0.0
-
-    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
+    def _base_batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
         List[List[float]], List[int]]:
+        """最底层的批量推理逻辑（不包含平滑和投票）"""
         m = self.models.get(target_model)
         if m is None:
             return [[0.5, 0.5] for _ in codes], [0] * len(codes)
 
-        # ========== 处理双头模型 ==========
         if m["type"] == "dual_head":
-            # 直接调用你的 batch_predict
             res = m["model_obj"].batch_predict(codes, batch_size=batch_size)
-
             if self.eval_mode == "binary":
-                f_det = res["f_det"]  # shape: (N,)
+                f_det = res["f_det"]
                 probs = [[1.0 - float(p), float(p)] for p in f_det]
                 preds = [1 if p > 0.5 else 0 for p in f_det]
             else:
-                f_cls = res["f_cls"]  # shape: (N, num_classes)
+                f_cls = res["f_cls"]
                 probs = f_cls.tolist()
                 preds = [int(np.argmax(p)) for p in f_cls]
-
             return probs, preds
-
-        # ========== 处理标准模型 ==========
         else:
             all_probs = []
             all_preds = []
-
             for i in range(0, len(codes), batch_size):
                 batch_codes = codes[i:i + batch_size]
                 inputs = m["tokenizer"](
@@ -197,25 +180,79 @@ class ModelZoo:
                 with torch.no_grad():
                     outputs = m["model"](**inputs)
                     probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
-
                     if probs.ndim == 1:
                         probs = [probs.tolist()]
                     else:
                         probs = probs.tolist()
-
                     preds = [int(np.argmax(p)) for p in probs]
-
                     all_probs.extend(probs)
                     all_preds.extend(preds)
-
             return all_probs, all_preds
+
+    # ================= 对外暴露的预测接口 =================
+    def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
+        """单条代码预测（根据配置决定是否使用多数表决）"""
+        if self.use_majority_voting and self.smoother:
+            samples = self.smoother.generate_smoothed_samples(code)
+            probs_list, preds_list = self._base_batch_predict(samples, target_model,
+                                                              batch_size=self.smoother.batch_size)
+
+            # 多数表决
+            vote_counter = Counter(preds_list)
+            majority_class = vote_counter.most_common(1)[0][0]
+
+            # 对概率取平均，保持接口一致性
+            avg_probs = np.mean(probs_list, axis=0).tolist()
+            return avg_probs, majority_class
+        else:
+            return self._base_predict(code, target_model)
+
+    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
+        List[List[float]], List[int]]:
+        """批量预测（根据配置决定是否使用多数表决，采用平铺加速推断）"""
+        if self.use_majority_voting and self.smoother:
+            # 1. 展平所有样本以充分利用 GPU 并行
+            all_samples = []
+            for code in codes:
+                all_samples.extend(self.smoother.generate_smoothed_samples(code))
+
+            # 2. 批量推断所有的平滑样本
+            all_probs, all_preds = self._base_batch_predict(all_samples, target_model, batch_size=batch_size)
+
+            # 3. 按原始顺序进行分组表决
+            final_probs = []
+            final_preds = []
+            num_samples = self.smoother.num_samples
+
+            for i in range(len(codes)):
+                start_idx = i * num_samples
+                end_idx = start_idx + num_samples
+
+                group_preds = all_preds[start_idx:end_idx]
+                group_probs = all_probs[start_idx:end_idx]
+
+                majority_class = Counter(group_preds).most_common(1)[0][0]
+                avg_probs = np.mean(group_probs, axis=0).tolist()
+
+                final_preds.append(majority_class)
+                final_probs.append(avg_probs)
+
+            return final_probs, final_preds
+        else:
+            return self._base_batch_predict(codes, target_model, batch_size)
+
+    def predict_label_conf(self, code: str, label: int, target_model: str) -> float:
+        """获取指定标签的置信度，自动继承 predict 的多数表决逻辑"""
+        probs, _ = self.predict(code, target_model)
+        if label < len(probs):
+            return probs[label]
+        return 0.0
 
     def predict_with_rejection(self, code: str, target_model: str,
                                candidate_dict: dict = None, sensitive_vars: list = None) -> Tuple[
         Union[int, str], float, float]:
         """
-        供鲁棒性评测脚本调用的核心防御接口。
-        返回: (预测标签/拒识标志, 置信度, 预测方差)
+        注意：内部必须使用 _base_batch_predict 避免重复平滑嵌套。
         """
         if not self.smoother:
             raise ValueError("[!] Smoother 未初始化，请在实例化 ModelZoo 时提供 smoother_config 和 candidate_generator。")
@@ -224,42 +261,34 @@ class ModelZoo:
         if m is None:
             return 0, 0.0, 0.0
 
-        # 1. 生成 N 个平滑变体
         samples = self.smoother.generate_smoothed_samples(code, candidate_dict, sensitive_vars)
         N = len(samples)
 
-        # 2. 批量获取底层推断结果并融合概率
         if m["type"] == "dual_head":
-            # 获取底层的原始 f_det 和 f_cls
             res = m["model_obj"].batch_predict(samples, batch_size=self.smoother.batch_size)
-            f_det = res["f_det"]  # shape: [N]
-            f_cls = res["f_cls"]  # shape: [N, C]
+            f_det = res["f_det"]
+            f_cls = res["f_cls"]
 
             C = f_cls.shape[1]
             raw_probs = np.zeros((N, C + 1))
-            raw_probs[:, 0] = 1.0 - f_det  # 第 0 类：P(Safe)
-            raw_probs[:, 1:] = f_det[:, np.newaxis] * f_cls  # 第 1~C 类：P(Vuln 且是类型 K)
-
+            raw_probs[:, 0] = 1.0 - f_det
+            raw_probs[:, 1:] = f_det[:, np.newaxis] * f_cls
         else:
-            # 如果是标准单头模型，直接调用 ModelZoo 的 batch_predict 获取统一的 probs
-            batch_probs, _ = self.batch_predict(samples, target_model, batch_size=self.smoother.batch_size)
-            raw_probs = np.array(batch_probs)  # 此时对于二分类 shape为 [N, 2]，多分类为 [N, C]
+            # 修改点：使用 _base_batch_predict，防止配置了多数表决后导致的双重采样计算
+            batch_probs, _ = self._base_batch_predict(samples, target_model, batch_size=self.smoother.batch_size)
+            raw_probs = np.array(batch_probs)
 
-        # 3. 多数表决 (Majority Voting)
         predictions = np.argmax(raw_probs, axis=1)
         vote_counter = Counter(predictions.tolist())
         majority_class, count = vote_counter.most_common(1)[0]
         confidence = count / N
 
-        # 4. 置信方差计算 (Variance Analysis)
         majority_probs = raw_probs[:, majority_class]
         variance = float(np.var(majority_probs, ddof=1)) if N > 1 else 0.0
 
-        # 5. 拒识决策 (Rejection)
         if variance > self.smoother.variance_threshold:
             return "Reject_Adversarial", confidence, variance
 
-        # 返回的是 C+1 融合空间下的类别。如果外部是二分类评测，1~C 统称为 1 (Vuln)
         if self.eval_mode == "binary" and majority_class > 0:
             majority_class = 1
 

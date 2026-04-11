@@ -11,7 +11,8 @@ run_params:
   iterations: 20  # 对应 GA 的 max_generations 或 Greedy 的迭代逻辑
   algorithm: "greedy"
   run_mode: "attack"
-  label_map: null
+  label_map: "./models/finetuned_model_codebert_1/label_map.json"
+  use_majority_voting: true
 
 model_zoo:
   CodeBERT: "./models/finetuned_model_codebert_1"
@@ -48,7 +49,7 @@ analyzer:
 mlm_engine:
   model_name: "microsoft/codebert-base-mlm"
 smoother:
-  num_samples: 50
+  num_samples: 5
   variance_threshold: 0.05
   replace_prob: 0.5
   batch_size: 32
