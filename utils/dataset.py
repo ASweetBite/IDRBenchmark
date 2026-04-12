@@ -38,14 +38,16 @@ class DatasetLoader:
 
         df["cwe"] = df["cwe"].fillna("").astype(str).str.strip()
 
-        print(f"[*] Data cleaning: Filtered {initial_count - len(df)} single-line or empty codes, {len(df)} valid samples remaining.")
+        print(
+            f"[*] Data cleaning: Filtered {initial_count - len(df)} single-line or empty codes, {len(df)} valid samples remaining.")
 
         processed_data = []
 
         if self.mode == "binary":
-            df['label'] = df['cwe'].apply(lambda x: 0 if str(x).lower() in self.safe_flags else 1)
+            # 🌟 核心修改：安全样本设为 -1，漏洞样本设为 1（或你需要的正数）
+            df['label'] = df['cwe'].apply(lambda x: -1 if str(x).lower() in self.safe_flags else 1)
 
-            safe_df = df[df['label'] == 0]
+            safe_df = df[df['label'] == -1]
             vuln_df = df[df['label'] == 1]
 
             print(f"[*] Original data distribution: Safe={len(safe_df)}, Vuln={len(vuln_df)}")
@@ -66,7 +68,8 @@ class DatasetLoader:
             vuln_sampled = vuln_df.sample(n=vuln_needed, random_state=random_seed)
 
             df = pd.concat([safe_sampled, vuln_sampled]).sample(frac=1, random_state=random_seed).reset_index(drop=True)
-            self.label_map = {0: "Safe", 1: "Vulnerable"}
+            # 🌟 映射表同步更新
+            self.label_map = {-1: "Safe", 1: "Vulnerable"}
 
         elif self.mode == "multi":
             df['label_raw'] = df['cwe'].apply(lambda x: "Safe" if str(x).lower() in self.safe_flags else x)
@@ -83,6 +86,8 @@ class DatasetLoader:
 
                     self.label_map = {int(k): v for k, v in raw_map.items()}
 
+                # 🌟 强制将 -1 分配给 Safe，防止历史映射文件出现歧义
+                self.label_map[-1] = "Safe"
                 cwe_to_id = {v: k for k, v in self.label_map.items()}
 
                 valid_mask = df['label_raw'].isin(cwe_to_id.keys())
@@ -95,9 +100,21 @@ class DatasetLoader:
 
             else:
                 print("[*] Generating new label mapping from current dataset...")
-                encoded_labels = self.label_encoder.fit_transform(df['label_raw'])
-                df['label'] = encoded_labels
-                self.label_map = {int(i): cls for i, cls in enumerate(self.label_encoder.classes_)}
+                # 🌟 核心修改：将 Safe 样本隔离，只对真正的 CWE 进行编码
+                is_safe = df['label_raw'] == "Safe"
+                vuln_cwes = df.loc[~is_safe, 'label_raw']
+
+                if not vuln_cwes.empty:
+                    self.label_encoder.fit(vuln_cwes)
+                    self.label_map = {int(i): cls for i, cls in enumerate(self.label_encoder.classes_)}
+                else:
+                    self.label_map = {}
+
+                # 🌟 手动将 Safe 强行绑定为 -1
+                self.label_map[-1] = "Safe"
+                cwe_to_id = {v: k for k, v in self.label_map.items()}
+
+                df['label'] = df['label_raw'].map(cwe_to_id)
 
                 if label_map_path:
                     os.makedirs(os.path.dirname(label_map_path) or '.', exist_ok=True)

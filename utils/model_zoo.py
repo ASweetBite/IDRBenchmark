@@ -115,19 +115,19 @@ class ModelZoo:
     def _base_predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
         """Performs raw single-inference logic without smoothing or voting."""
         m = self.models.get(target_model)
-        if m is None:
-            return [0.5, 0.5], 0
+        if m is None: return [1.0, 0.0], -1
 
         if m["type"] == "dual_head":
             res = m["model_obj"].predict(code)
-            if self.eval_mode == "binary":
-                p_vuln = res["f_det"]
-                probs = [1.0 - p_vuln, p_vuln]
-                pred_label = 1 if p_vuln > 0.5 else 0
+            p_vuln = float(res["f_det"])
+            if p_vuln <= 0.5:
+                return [1.0 - p_vuln, p_vuln], -1
             else:
-                probs = res["f_cls"]
-                pred_label = int(np.argmax(probs))
-            return probs, pred_label
+                if self.eval_mode == "binary":
+                    return [1.0 - p_vuln, p_vuln], 1
+                else:
+                    probs = res["f_cls"]
+                    return probs.tolist(), int(np.argmax(probs))
         else:
             inputs = m["tokenizer"](
                 code, return_tensors="pt", truncation=True, max_length=512, padding="max_length"
@@ -141,22 +141,30 @@ class ModelZoo:
 
     def _base_batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
         List[List[float]], List[int]]:
-        """Performs raw batch-inference logic without smoothing or voting."""
         m = self.models.get(target_model)
-        if m is None:
-            return [[0.5, 0.5] for _ in codes], [0] * len(codes)
+        if m is None: return [[1.0, 0.0]] * len(codes), [-1] * len(codes)
 
         if m["type"] == "dual_head":
             res = m["model_obj"].batch_predict(codes, batch_size=batch_size)
+            f_det = res["f_det"]  # 假设是 (B,) 的漏洞概率
+
+            final_probs = []
+            final_preds = []
+
             if self.eval_mode == "binary":
-                f_det = res["f_det"]
-                probs = [[1.0 - float(p), float(p)] for p in f_det]
-                preds = [1 if p > 0.5 else 0 for p in f_det]
+                for p in f_det:
+                    p = float(p)
+                    final_probs.append([1.0 - p, p])
+                    final_preds.append(1 if p > 0.5 else -1)  # 🌟 修正为 -1
             else:
-                f_cls = res["f_cls"]
-                probs = f_cls.tolist()
-                preds = [int(np.argmax(p)) for p in f_cls]
-            return probs, preds
+                f_cls = res["f_cls"]  # (B, num_classes)
+                for p_det, p_cls in zip(f_det, f_cls):
+                    p_det = float(p_det)
+                    final_probs.append(p_cls.tolist())
+                    # 🌟 只有检测头过关，才返回 CWE ID，否则返回 -1
+                    final_preds.append(int(np.argmax(p_cls)) if p_det > 0.5 else -1)
+
+            return final_probs, final_preds
         else:
             all_probs, all_preds = [], []
             for i in range(0, len(codes), batch_size):
@@ -175,19 +183,40 @@ class ModelZoo:
             return all_probs, all_preds
 
     def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
-        """Predicts the label for a single code snippet, applying majority voting if enabled."""
+        """Predicts the label for a single code snippet.
+        Applies Monte Carlo smoothing and majority voting.
+        If variance is high (adversarial attack detected), it silently canonicalizes the code
+        and forces a standard definitive prediction.
+        """
         if self.use_majority_voting and self.smoother:
             samples = self.smoother.generate_smoothed_samples(code)
             probs_list, preds_list = self._base_batch_predict(samples, target_model,
                                                               batch_size=self.smoother.batch_size)
+
             majority_class = Counter(preds_list).most_common(1)[0][0]
+
+            majority_probs = [probs[majority_class] for probs in probs_list]
+            variance = float(np.var(majority_probs, ddof=1)) if len(samples) > 1 else 0.0
+
+            if variance > self.smoother.variance_threshold:
+                # 触发防御：静默去噪并强制输出标准结果
+                canonical_code = self.smoother.analyzer.canonicalize(code) if hasattr(self.smoother.analyzer,
+                                                                                      'canonicalize') else code
+                fallback_probs, fallback_pred = self._base_predict(canonical_code, target_model)
+                # 直接返回整数标签，对外隐藏防御动作
+                return fallback_probs, fallback_pred
+
             avg_probs = np.mean(probs_list, axis=0).tolist()
             return avg_probs, majority_class
+
         return self._base_predict(code, target_model)
 
     def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
         List[List[float]], List[int]]:
-        """Predicts labels for a batch of code snippets using efficient flattened inference."""
+        """Predicts labels for a batch of code snippets using efficient flattened inference.
+        Ensures the output is always a valid list of probabilities and integer labels,
+        silently falling back to canonicalized code for high-variance samples.
+        """
         if self.use_majority_voting and self.smoother:
             all_samples = []
             for code in codes:
@@ -195,20 +224,77 @@ class ModelZoo:
 
             all_probs, all_preds = self._base_batch_predict(all_samples, target_model, batch_size=batch_size)
 
-            final_probs, final_preds = [], []
+            final_probs = [[] for _ in range(len(codes))]
+            final_preds = [0 for _ in range(len(codes))]
             num_samples = self.smoother.num_samples
+
+            fallback_indices = []
+            fallback_codes = []
 
             for i in range(len(codes)):
                 start_idx = i * num_samples
                 end_idx = start_idx + num_samples
+
                 group_preds = all_preds[start_idx:end_idx]
                 group_probs = all_probs[start_idx:end_idx]
 
-                final_preds.append(Counter(group_preds).most_common(1)[0][0])
-                final_probs.append(np.mean(group_probs, axis=0).tolist())
+                majority_class = Counter(group_preds).most_common(1)[0][0]
+
+                majority_probs = [probs[majority_class] for probs in group_probs]
+                variance = float(np.var(majority_probs, ddof=1)) if num_samples > 1 else 0.0
+
+                if variance > self.smoother.variance_threshold:
+                    # 记录需要兜底的索引，准备二次预测
+                    fallback_indices.append(i)
+                    canonical_code = self.smoother.analyzer.canonicalize(codes[i]) if hasattr(self.smoother.analyzer,
+                                                                                              'canonicalize') else \
+                    codes[i]
+                    fallback_codes.append(canonical_code)
+                else:
+                    final_preds[i] = majority_class
+                    final_probs[i] = np.mean(group_probs, axis=0).tolist()
+
+            # 对所有高方差样本进行批量的去噪预测
+            if fallback_codes:
+                fb_probs, fb_preds = self._base_batch_predict(fallback_codes, target_model, batch_size=batch_size)
+
+                # 将去噪后的结果以标准格式（float和int）回填
+                for idx, prob, pred in zip(fallback_indices, fb_probs, fb_preds):
+                    final_preds[idx] = pred
+                    final_probs[idx] = prob
 
             return final_probs, final_preds
+
         return self._base_batch_predict(codes, target_model, batch_size)
+    # def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
+    #     """
+    #     [纯标准化测试版]
+    #     仅对输入代码进行 AST 规范化去噪，然后进行单次预测。
+    #     用于测试模型在失去所有变量语义情况下的基础 F1 得分和原生防御力。
+    #     """
+    #     # 1. 强制进行代码规范化（抹除所有变量名/函数名）
+    #     canonical_code = self.smoother.analyzer.canonicalize(code) if self.smoother and hasattr(self.smoother.analyzer,
+    #                                                                                             'canonicalize') else code
+    #
+    #     # 2. 直接使用规范化后的代码进行单次预测（无平滑开销）
+    #     probs, pred = self._base_predict(canonical_code, target_model)
+    #
+    #     return probs, pred
+    #
+    # def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
+    #     List[List[float]], List[int]]:
+    #     """
+    #     [纯标准化测试版]
+    #     对批量输入的代码进行 AST 规范化去噪，然后进行高效扁平化推理。
+    #     """
+    #     if self.smoother and hasattr(self.smoother.analyzer, 'canonicalize'):
+    #         # 在 CPU 上极速批量处理规范化
+    #         canonical_codes = [self.smoother.analyzer.canonicalize(code) for code in codes]
+    #     else:
+    #         canonical_codes = codes
+    #
+    #     # 直接将全部规范化代码送入 GPU 进行批处理推理
+    #     return self._base_batch_predict(canonical_codes, target_model, batch_size=batch_size)
 
     def predict_label_conf(self, code: str, label: int, target_model: str) -> float:
         """Retrieves confidence for a specific label, inheriting the current prediction logic."""

@@ -1,5 +1,7 @@
 import re
 from collections import defaultdict
+from typing import Union
+
 from tree_sitter import Language, Parser
 
 
@@ -222,6 +224,55 @@ class IdentifierAnalyzer:
             "style": style,
             "count": len(words)
         }
+
+    def canonicalize(self, source_code: Union[str, bytes]) -> str:
+        """
+        [防御专属] 代码规范化兜底方法：
+        将所有提取出的自定义变量和函数替换为泛化 Token (VARx, FUNCx)。
+        用于在高方差告警时，物理隔离标识符级别的对抗攻击。
+        """
+        if isinstance(source_code, str):
+            code_bytes = source_code.encode("utf-8")
+        else:
+            code_bytes = source_code
+
+        identifiers = self.extract_identifiers(code_bytes)
+        if not identifiers:
+            return code_bytes.decode("utf-8")
+
+        var_counter = 1
+        func_counter = 1
+        renaming_map = {}
+
+        # 排序以保证相同的代码片段每次规范化的结果一致（Deterministic）
+        for name in sorted(identifiers.keys()):
+            # 取该标识符第一次出现的信息，判断它是函数还是变量
+            entity_info = identifiers[name][0]
+            entity_type = entity_info.get("entity_type", "variable")
+
+            if entity_type == "function":
+                # 防止源码中本身就有 FUNC1 导致命名冲突
+                while f"FUNC{func_counter}" in identifiers:
+                    func_counter += 1
+                renaming_map[name] = f"FUNC{func_counter}"
+                func_counter += 1
+            else:
+                # 防止源码中本身就有 VAR1 导致命名冲突
+                while f"VAR{var_counter}" in identifiers:
+                    var_counter += 1
+                renaming_map[name] = f"VAR{var_counter}"
+                var_counter += 1
+
+        try:
+            # 使用现有的 CodeTransformer 进行安全替换
+            # 传入 analyzer=None 绕过严格的范围校验，强制执行全局替换
+            canonical_code = CodeTransformer.validate_and_apply(
+                code_bytes, identifiers, renaming_map, analyzer=None
+            )
+            return canonical_code
+        except Exception as e:
+            # 如果在极端情况下发生转换异常，作为最后防线，直接返回原码
+            return code_bytes.decode("utf-8")
 
 
 def is_valid_identifier(name: str) -> bool:

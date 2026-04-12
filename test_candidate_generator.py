@@ -1,76 +1,82 @@
 import os
-from tabulate import tabulate
-from attacks.generators import CodeBasedCandidateGenerator
-from utils.model_zoo import ModelZoo
+import sys
+from collections import defaultdict
+
+# 假设你的文件结构如下，确保路径能正确导入
 from utils.ast_tools import IdentifierAnalyzer
+from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 
 
-def run_kernel_code_test(generator, analyzer):
-    # 1. 准备内核源码样例
-    kernel_code = (
-        "static int ipgre_close(struct net_device *dev)\n"
-        "{\n"
-        "    struct ip_tunnel *t = netdev_priv(dev);\n"
-        "\n"
-        "    if (ipv4_is_multicast(t->parms.iph.daddr) && t->mlink) {\n"
-        "        struct in_device *in_dev;\n"
-        "        in_dev = inetdev_by_index(dev_net(dev), t->mlink);\n"
-        "        if (in_dev) {\n"
-        "            ip_mc_dec_group(in_dev, t->parms.iph.daddr);\n"
-        "            in_dev_put(in_dev);\n"
-        "        }\n"
-        "    }\n"
-        "    return 0;\n"
-        "}\n"
-    )
+def test_visualization():
+    # 1. 初始化工具
+    # 注意：这里的 model_zoo 可以传入 None 或 Mock，因为我们主要测试结构逻辑
+    # 如果 generate_structural_candidates 内部需要 MLM 词汇，请确保已经有基础词库
+    analyzer = IdentifierAnalyzer(lang="cpp")
+    generator = HeavyWeightCandidateGenerator(mlm_engine=None, analyzer=analyzer)
 
-    # 2. 定义我们要测试的标识符（涵盖函数名、指针、局部变量）
-    targets = ["ipgre_close", "in_dev", "dev", "t", "mlink","ipv4_is_multicast"]
+    # 2. 准备测试用例：覆盖各种复杂的命名场景
+    test_cases = [
+        "ResReturnBuf",  # PascalCase [3, 6, 3]
+        "user_login_count",  # snake_case [4, 5, 5]
+        "_ptrIdx",  # camelCase [3, 3] 带下划线前缀
+        "__init_data",  # snake_case [4, 4] 带双下划线
+        "mixed_StyleName",  # 混合风格 (根据你的要求，应走 snake_case)
+        "data2_ptr",  # 带数字的下划线
+        "i",  # 单字母
+    ]
 
-    print("\n" + " 🧪 Linux 内核代码重命名测试 ".center(80, "="))
-    print(f"原始函数名: ipgre_close")
+    # 3. 模拟一个词库 (优化 A 的体现)
+    # 在实际运行中，这些词应该来自 MLM 或本地代码
+    mock_mlm_seeds = [
+        "get", "set", "val", "ptr", "data", "info", "buffer", "process",
+        "result", "index", "item", "handle", "status", "output", "input"
+    ]
+    # 手动填充一下 generator 的词库，防止生成的列表为空
+    generator.local_pool = generator._build_length_pool(mock_mlm_seeds, [])
 
-    summary = []
-    ids = analyzer.extract_identifiers(kernel_code.encode("utf-8"))
+    # 4. 打印表头
+    header = f"{'Original Name':<20} | {'Generated Candidate':<20} | {'Style':<12} | {'Lengths':<12} | {'Status'}"
+    print("\n" + "=" * 85)
+    print(header)
+    print("-" * 85)
 
-    for target in targets:
-        print(f"正在分析标识符: {target}...")
+    dummy_code = "void dummy() { int " + ", ".join(test_cases) + "; }"
+
+    for original in test_cases:
+        # 获取原词格式信息
+        orig_info = analyzer.analyze_format(original)
 
         # 生成候选词
-        candidates = generator.generate_candidates(
-            code=kernel_code,
-            target_name=target,
-            identifiers=ids,
-            top_k_mlm=50,
-            top_n_keep=10
-        )
+        # 注意：确保你的 generator 类中有这个方法
+        candidates = generator.generate_structural_candidates(dummy_code, original, top_n_keep=10)
 
-        summary.append([
-            target,
-            "Function" if "close" in target else "Variable/Member",
-            len(candidates),
-            ", ".join(candidates[:6])
-        ])
+        if not candidates:
+            print(
+                f"{original:<20} | {'[No Candidates]':<20} | {orig_info['style']:<12} | {str(orig_info['lengths']):<12} | ⚠️")
+            continue
 
-    # 3. 展示结果
-    headers = ["标识符 (Target)", "类型", "生成数量", "候选词预览 (Top 6)"]
-    print("\n" + " 生成结果报告 ".center(100, "-"))
-    print(tabulate(summary, headers=headers, tablefmt="grid"))
-    print("-" * 100)
+        for i, cand in enumerate(candidates):
+            cand_info = analyzer.analyze_format(cand)
+
+            # 验证逻辑
+            style_ok = orig_info['style'] == cand_info['style']
+            len_ok = orig_info['lengths'] == cand_info['lengths']
+            prefix_ok = orig_info['prefix'] == cand_info['prefix']
+
+            status = "✅" if (style_ok and len_ok and prefix_ok) else "❌"
+
+            # 第一行显示原名，后续行留空以便阅读
+            display_name = original if i == 0 else ""
+            print(
+                f"{display_name:<20} | {cand:<20} | {cand_info['style']:<12} | {str(cand_info['lengths']):<12} | {status}")
+
+        print("-" * 85)
 
 
 if __name__ == "__main__":
-    # 初始化环境 (请确保路径与你本地一致)
-    model_configs = {"CodeBERT": "./models/binary_diversevul_codebert"}
-
-    if not os.path.exists(model_configs["CodeBERT"]):
-        print("错误：请检查模型路径！")
-        exit()
-
-    print("[*] 正在加载 CodeBERT MLM 模型...")
-    zoo = ModelZoo(model_configs)
-    # 内核代码通常是 C 语言，这里指定 C
-    analyzer = IdentifierAnalyzer(lang="c")
-    generator = CodeBasedCandidateGenerator(zoo, analyzer)
-
-    run_kernel_code_test(generator, analyzer)
+    # 模拟环境设置
+    try:
+        test_visualization()
+    except Exception as e:
+        print(f"运行失败: {e}")
+        print("请检查 ast_tools.py 是否已添加 analyze_format 方法，以及 CodeBasedCandidateGenerator.py 是否已添加相应逻辑。")

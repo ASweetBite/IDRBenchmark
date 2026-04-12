@@ -190,7 +190,7 @@ class GreedyOptimizer:
 
             candidate_strings = [item[1] for item in codes_to_predict]
 
-            batch_probs, batch_preds = self.model_zoo._base_batch_predict(candidate_strings, self.target_model)
+            batch_probs, batch_preds = self.model_zoo.batch_predict(candidate_strings, self.target_model)
 
             best_var_fitness = float('-inf')
             best_var_code = None
