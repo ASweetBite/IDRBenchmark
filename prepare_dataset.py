@@ -1,33 +1,33 @@
-import pandas as pd
+import polars as pl
+import time
 
-# 请将这里的路径替换为你本地某个 parquet 文件的实际路径
-file_path = 'data/cleaned_dataset.parquet'
 
-try:
-    # 1. 读取数据 (只读取需要的两列以节省内存和加快速度)
-    df = pd.read_parquet(file_path, columns=['func', 'vul'])
+def process_bigvul_polars(input_path, output_path):
+    """Processes the BigVul dataset using Polars lazy execution to filter specific C/C++ columns and saves it as a Parquet file."""
+    print(f"开始处理数据集: {input_path}")
+    start_time = time.time()
 
-    # 2. 过滤出 vul = 1 的样本
-    vul_df = df[df['vul'] == 1]
+    lazy_df = pl.scan_csv(input_path, ignore_errors=True)
 
-    if vul_df.empty:
-        print("在这个文件中没有找到 vul = 1 的样本。")
-    else:
-        # 3. 随机抽取 3 个样本（如果总数不足 3 个则全部取出）
-        sample_size = min(5, len(vul_df))
-        samples = vul_df.sample(n=sample_size)
+    query = (
+        lazy_df
+        .filter(pl.col("lang").is_in(['C', 'C++', 'CPP', 'c', 'c++', 'cpp']))
+        .select([
+            pl.col("func_before"),
+            pl.col("func_after"),
+            pl.col("CWE ID").alias("cwe")
+        ])
+    )
 
-        print(f"该文件共有 {len(vul_df)} 个漏洞样本。以下是随机抽取的 {sample_size} 个：\n")
-        print("=" * 60)
+    query.sink_parquet(output_path, compression="snappy")
 
-        # 4. 打印代码内容
-        for index, row in samples.iterrows():
-            print(f"【数据行索引 (Index): {index}】")
-            print("【原始代码 (func)】:")
-            print(row['func'])
-            print("=" * 60)
+    end_time = time.time()
+    print(f"处理完成！已保存至 {output_path}")
+    print(f"总耗时: {end_time - start_time:.2f} 秒")
 
-except FileNotFoundError:
-    print(f"错误：找不到文件 {file_path}，请检查路径是否正确。")
-except Exception as e:
-    print(f"读取或处理文件时发生错误: {e}")
+
+if __name__ == "__main__":
+    INPUT_FILE = "data/MSR_data_cleaned.csv"
+    OUTPUT_FILE = "data/bigvul_polars.parquet"
+
+    process_bigvul_polars(INPUT_FILE, OUTPUT_FILE)
