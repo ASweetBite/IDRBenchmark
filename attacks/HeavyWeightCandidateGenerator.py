@@ -1,10 +1,8 @@
-import concurrent.futures
 import itertools
 import random
 import re
 from collections import defaultdict
 from typing import List, Any
-
 import torch
 import torch.nn.functional as F
 
@@ -103,6 +101,33 @@ class HeavyWeightCandidateGenerator:
         else:
             return "".join(predicted_words)
 
+    def _get_code_embedding_batched(self, code_snippets: List[str], batch_size: int = 64) -> torch.Tensor:
+        """Performs batch inference to get sequence-level embeddings for code snippets using Mean Pooling."""
+        all_embeddings = []
+        tokenizer = self.mlm_engine.tokenizer
+
+        for i in range(0, len(code_snippets), batch_size):
+            batch_texts = code_snippets[i: i + batch_size]
+            inputs = tokenizer(
+                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=512
+            ).to(self.mlm_engine.device)
+
+            with torch.no_grad():
+                # Request hidden states to extract the sequence representations
+                outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
+                # Usually, hidden_states[-1] is the last layer's hidden states: [batch, seq_len, hidden_dim]
+                last_hidden = outputs.hidden_states[-1]
+
+                # Mean Pooling: Ignore padding tokens
+                attention_mask = inputs['attention_mask'].unsqueeze(-1).expand(last_hidden.size()).float()
+                sum_embeddings = torch.sum(last_hidden * attention_mask, dim=1)
+                sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
+                mean_pooled = sum_embeddings / sum_mask
+
+                all_embeddings.append(mean_pooled.cpu().detach())  # Offload to CPU to save VRAM
+
+        return torch.cat(all_embeddings, dim=0)
+
     def _get_model_logits_batched(self, cropped_codes: List[str]):
         """Performs batch inference to obtain model logits and mask indices for multiple code snippets."""
         if not cropped_codes:
@@ -154,7 +179,7 @@ class HeavyWeightCandidateGenerator:
             return None
 
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
-        """Filters candidates based on semantic similarity, naming style, and keyword conflicts."""
+        """Filters candidates based on contextual semantic similarity, naming style, and keyword conflicts."""
         filtered_cands = []
         for cand in candidate_list:
             if cand in ctx['keywords'] or cand == ctx['target_name']: continue
@@ -162,19 +187,24 @@ class HeavyWeightCandidateGenerator:
             filtered_cands.append(cand)
 
         semantically_valid = []
-        if not is_full_context and ctx['semantic_threshold'] > 0 and ctx['original_emb'] is not None:
-            cand_embs = []
+        if not is_full_context and ctx['semantic_threshold'] > 0 and ctx['original_code_emb'] is not None:
+            cand_codes = []
             valid_cands_temp = []
-            for cand in filtered_cands:
-                emb = self._get_word_embedding(cand)
-                if emb is not None:
-                    cand_embs.append(emb)
-                    valid_cands_temp.append(cand)
 
-            if cand_embs:
-                cand_tensor = torch.stack(cand_embs).to(ctx['original_emb'].device)
-                orig_tensor = ctx['original_emb'].unsqueeze(0)
-                sims = F.cosine_similarity(orig_tensor, cand_tensor)
+            for cand in filtered_cands:
+                # 【修复此处】：使用 local_prefix 和 local_suffix 拼接替换后的 AST 切片
+                replaced_code = ctx['local_prefix'] + cand + ctx['local_suffix']
+                cand_codes.append(replaced_code)
+                valid_cands_temp.append(cand)
+
+            if cand_codes:
+                # Get embeddings for all candidate code variations
+                cand_embs = self._get_code_embedding_batched(cand_codes)
+                cand_embs = cand_embs.to(self.mlm_engine.device)
+                orig_tensor = ctx['original_code_emb'].to(self.mlm_engine.device)
+
+                # Compare entire snippet semantics
+                sims = F.cosine_similarity(orig_tensor, cand_embs)
 
                 for cand, sim in zip(valid_cands_temp, sims):
                     if sim.item() >= ctx['semantic_threshold']:
@@ -194,6 +224,54 @@ class HeavyWeightCandidateGenerator:
 
         return added
 
+    def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int) -> tuple[str, str]:
+        """
+        利用 Tree-sitter AST 精准提取变量所在的最小逻辑语句（Statement）。
+        向上回溯节点，直到其父节点是一个块作用域或全局作用域。
+        """
+        # 使用 analyzer 中已配置好的 language 创建临时 parser
+        from tree_sitter import Parser
+        parser = Parser()
+        parser.language = self.analyzer.language
+        tree = parser.parse(code_bytes)
+
+        # 1. 找到精准匹配目标字节范围的 AST 节点
+        node = tree.root_node.descendant_for_byte_range(target_start, target_end)
+
+        if not node:
+            # 极端异常情况下的降级：退回物理行
+            line_start = code_bytes.rfind(b'\n', 0, target_start) + 1
+            line_end = code_bytes.find(b'\n', target_end)
+            if line_end == -1: line_end = len(code_bytes)
+            return (code_bytes[line_start:target_start].decode("utf-8", errors="replace"),
+                    code_bytes[target_end:line_end].decode("utf-8", errors="replace"))
+
+        # 2. 向上回溯，寻找包含该变量的完整语句层级
+        statement_node = node
+        # 遇到这些父节点类型时停止回溯，意味着当前 node 已经是一个完整的 Statement/Declaration
+        stop_parent_types = {
+            'compound_statement',  # { ... } 内部的语句
+            'translation_unit',  # 全局文件的顶层语句
+            'function_definition',  # 防止把整个函数体都切进去
+            'for_statement',  # 防止提取出整个 for 循环块，只保留初始化或条件部分
+            'while_statement',
+            'if_statement'
+        }
+
+        while statement_node.parent:
+            if statement_node.parent.type in stop_parent_types:
+                break
+            statement_node = statement_node.parent
+
+        stmt_start = statement_node.start_byte
+        stmt_end = statement_node.end_byte
+
+        # 3. 截取该 Statement 内部，变量前和变量后的字符串作为 prefix 和 suffix
+        local_prefix = code_bytes[stmt_start:target_start].decode("utf-8", errors="replace")
+        local_suffix = code_bytes[target_end:stmt_end].decode("utf-8", errors="replace")
+
+        return local_prefix, local_suffix
+
     def _generate_core(self, code: str, target_name: str, identifiers: dict,
                        top_k_mlm: int, top_n_keep: int, semantic_threshold: float,
                        context_ratio: float, preserve_style: bool, strict_structure: bool) -> List[str]:
@@ -208,13 +286,28 @@ class HeavyWeightCandidateGenerator:
         if target_name not in identifiers: return []
 
         original_style = self._detect_naming_style(target_name)
-        original_emb = self._get_word_embedding(target_name) if semantic_threshold > 0 else None
-        if original_emb is not None:
-            original_emb = original_emb.to(self.mlm_engine.device)
 
+        # 获取目标变量在字节码中的位置信息
         target_info = identifiers[target_name][0]
         prefix = code_bytes[:target_info['start']]
         suffix = code_bytes[target_info['end']:]
+
+        # ==================== 新增：基于 AST 提取局部切片 ====================
+        # 获取用于计算相似度的精确语句级上下文
+        local_prefix, local_suffix = self._extract_local_context_ast(
+            code_bytes,
+            target_info['start'],
+            target_info['end']
+        )
+
+        original_code_emb = None
+        if semantic_threshold > 0:
+            # 组装原始的完整语句，并获取它的 Embedding
+            original_local_str = local_prefix + target_name + local_suffix
+            original_code_emb = self._get_code_embedding_batched([original_local_str])
+            if original_code_emb is not None:
+                original_code_emb = original_code_emb.to(self.mlm_engine.device)
+        # =====================================================================
 
         parts, style = self._split_identifier(target_name)
         n_parts = len(parts)
@@ -244,6 +337,7 @@ class HeavyWeightCandidateGenerator:
                             variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
 
         cropped_codes = []
+        # ==================== 保持不变：MLM 推理用的全局大上下文 ====================
         context_half = 700
         mask_start = len(prefix)
 
@@ -317,11 +411,17 @@ class HeavyWeightCandidateGenerator:
                         seen_sub.add(lst[j])
                         unique_sub.append(lst[j])
 
+        # ==================== 新增：传入 local_prefix 等参数供相似度验证使用 ====================
         ctx = {
             'code_bytes': code_bytes, 'target_name': target_name, 'identifiers': identifiers,
             'keywords': self.analyzer.keywords, 'original_style': original_style,
-            'original_emb': original_emb, 'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style
+            'original_code_emb': original_code_emb,     # 替换了原来的 original_emb
+            'local_prefix': local_prefix,               # 传入 AST 切片前缀
+            'local_suffix': local_suffix,               # 传入 AST 切片后缀
+            'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style
         }
+        # ========================================================================================
+
         final_candidates = []
         target_full_quota = int(top_n_keep * context_ratio)
 
