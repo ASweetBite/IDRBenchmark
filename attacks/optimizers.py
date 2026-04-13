@@ -153,7 +153,7 @@ class GreedyOptimizer:
         self.rename_fn = rename_fn
         self.mode = mode
 
-        run_cfg = config.get('run_params', {})
+        run_cfg = config.get('run_params', {}) if config else {}
         self.run_mode = run_cfg.get('run_mode', 'attack')
 
     def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
@@ -200,11 +200,22 @@ class GreedyOptimizer:
             for i in range(len(codes_to_predict)):
                 probs = batch_probs[i]
                 pred = batch_preds[i]
-                orig_prob = max(probs[original_pred], 1e-9)
+
+                orig_idx = 0 if original_pred == -1 else original_pred
+
+                if orig_idx >= len(probs):
+                    orig_idx = len(probs) - 1
+
+                orig_prob = max(probs[orig_idx], 1e-9)
 
                 if self.mode == "binary":
-                    target_label = 1 - original_pred
-                    target_prob = max(probs[target_label], 1e-9)
+                    target_idx = 1 if original_pred == -1 else 0
+
+                    if target_idx >= len(probs):
+                        target_idx = len(probs) - 1
+
+                    target_prob = max(probs[target_idx], 1e-9)
+
                     fitness = math.log(target_prob) - math.log(orig_prob)
                 else:
                     fitness = -orig_prob

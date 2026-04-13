@@ -108,4 +108,4 @@ def evaluate_models(test_data_path, model_names):
 
 if __name__ == "__main__":
     # 使用刚清洗好的 Parquet 文件跑测试
-    evaluate_models("./data/bigvul_polars.parquet", ["CodeBERT"])
+    evaluate_models("./data/test_binary.parquet", ["CodeBERT"])

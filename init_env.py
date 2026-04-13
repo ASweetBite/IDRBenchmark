@@ -18,6 +18,7 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 from datasets import Dataset
 from peft import get_peft_model, LoraConfig, TaskType
 
+# 导入你写好的 SPT 混淆模块
 from test_spt import obfuscate
 
 # =============== 环境配置 ===============
@@ -25,6 +26,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class BiLSTMClassifier(nn.Module):
     def __init__(self, vocab_size, embed_dim=128, hidden_dim=256, num_labels=2):
@@ -48,35 +50,33 @@ class BiLSTMClassifier(nn.Module):
         return SequenceClassifierOutput(loss=loss, logits=logits)
 
 
-def augment_vulnerable_data(df_vul: pd.DataFrame, needed_count: int) -> pd.DataFrame:
-    vul_funcs = df_vul['func'].tolist()
+# 🚀 修改 1：将函数改为通用的 augment_data，支持指定 label
+def augment_data(df: pd.DataFrame, needed_count: int, label_value: int) -> pd.DataFrame:
+    funcs = df['func'].tolist()
 
-    # 预过滤：跳过超过 3000 字符的超大样本，这是卡死和拖慢速度的元凶
-    vul_funcs = [f for f in vul_funcs if len(f) <= 3000]
-    n_samples = len(vul_funcs)
+    # 预过滤：跳过超过 3000 字符的超大样本
+    funcs = [f for f in funcs if len(f) <= 3000]
+    n_samples = len(funcs)
 
     if n_samples == 0:
         return pd.DataFrame({'func': [], 'label': []})
 
-    # 计算每个样本应该被增强的基础次数 (比如需要 50k, 现有 20k，每人分配 2 次)
     base_aug = needed_count // n_samples
     remainder = needed_count % n_samples
 
-    # 均匀分配增强配额
     aug_counts = [base_aug] * n_samples
     for idx in random.sample(range(n_samples), remainder):
         aug_counts[idx] += 1
 
     augmented_funcs = []
-    print(f"[*] 样本分配策略: 平均每个样本进行 {base_aug} 到 {base_aug + 1} 次混淆...")
+    label_name = "漏洞(1)" if label_value == 1 else "安全(0)"
+    print(f"[*] {label_name} 样本分配策略: 平均每个样本进行 {base_aug} 到 {base_aug + 1} 次混淆...")
 
-    pbar = tqdm(total=needed_count, desc="Augmenting")
+    pbar = tqdm(total=needed_count, desc=f"Augmenting {label_name}")
 
-    # 遍历每个样本，执行指定次数的混淆
-    for code, target_count in zip(vul_funcs, aug_counts):
+    for code, target_count in zip(funcs, aug_counts):
         successful = 0
         attempts = 0
-        # 给予容错空间：如果一个样本由于语法问题一直混淆失败，最多尝试 target_count * 3 次后放弃
         while successful < target_count and attempts < target_count * 3:
             attempts += 1
             try:
@@ -87,12 +87,11 @@ def augment_vulnerable_data(df_vul: pd.DataFrame, needed_count: int) -> pd.DataF
             except Exception:
                 continue
 
-    # 如果因为部分样本报错导致总数没凑齐，进行最后的小额补足
     missing = needed_count - len(augmented_funcs)
     attempts = 0
     while missing > 0 and attempts < missing * 5:
         attempts += 1
-        code = random.choice(vul_funcs)
+        code = random.choice(funcs)
         try:
             new_code = obfuscate(code)
             augmented_funcs.append(new_code)
@@ -102,7 +101,7 @@ def augment_vulnerable_data(df_vul: pd.DataFrame, needed_count: int) -> pd.DataF
             pass
 
     pbar.close()
-    return pd.DataFrame({'func': augmented_funcs, 'label': 1})
+    return pd.DataFrame({'func': augmented_funcs, 'label': label_value})
 
 
 # =============== 🛠️ 核心数据准备逻辑 ===============
@@ -111,8 +110,6 @@ def prepare_dataset(parquet_path):
     print(f"[*] Loading dataset from: {parquet_path}")
     df = pd.read_parquet(parquet_path)
 
-    # 直接使用 vul 字段作为 label
-    # 假设 vul 已经是 0/1 或 True/False
     df['label'] = df['vul'].astype(int)
 
     # 基础清洗：长度过滤
@@ -122,47 +119,62 @@ def prepare_dataset(parquet_path):
     df_safe = df[df['label'] == 0]
     df_vul = df[df['label'] == 1]
 
-    # 实时统计打印，确保不再出现之前的统计错误
     real_vul_count = len(df_vul)
     real_safe_count = len(df_safe)
     print(f"[*] 真实标签分布: 安全(0)={real_safe_count}, 漏洞(1)={real_vul_count}")
 
-    # 设定 1:1 平衡目标
+    # 设定总量目标 (每类 8 万，总共 16 万)
     target_count = 80000
 
-    # 1. 安全样本：从 31 万中随机下采样 3 万
-    if real_safe_count > target_count:
-        sampled_safe = df_safe.sample(n=target_count, random_state=42)
-    else:
-        sampled_safe = df_safe  # 如果不足 3 万则全取
+    # ================= 🚀 修改 2：实现完美的对称增强 =================
 
-    # 2. 漏洞样本：补齐到 3 万
+    # 步骤 A: 漏洞样本处理
     if real_vul_count < target_count:
-        needed = target_count - real_vul_count
-        print(f"[*] 漏洞样本缺口: {needed}，启动增强程序...")
-
-        # 调用增强函数
-        aug_df_vul = augment_vulnerable_data(df_vul, needed)
-
-        # 合并【原生漏洞】+【增强漏洞】
+        needed_vul = target_count - real_vul_count
+        print(f"\n[*] 漏洞样本缺口: {needed_vul}，启动漏洞样本增强...")
+        aug_df_vul = augment_data(df_vul, needed_vul, label_value=1)
         sampled_vul = pd.concat([df_vul, aug_df_vul], ignore_index=True)
+        # 记录原生的数量，用于安全样本对齐
+        vul_original_used = real_vul_count
+        vul_aug_used = needed_vul
     else:
-        # 如果原生漏洞已经超过 3 万，则采样
         sampled_vul = df_vul.sample(n=target_count, random_state=42)
+        vul_original_used = target_count
+        vul_aug_used = 0
 
-    # 3. 最终合并并彻底打乱顺序
+    # 步骤 B: 安全样本处理 (强制使其结构与漏洞样本一模一样)
+    print(f"\n[*] 为了防止捷径学习，安全样本将强制采用相同的 [原生:增强] 比例：{vul_original_used} : {vul_aug_used}")
+
+    # 1. 抽取与漏洞原生数量相等的原生安全样本
+    base_safe = df_safe.sample(n=vul_original_used, random_state=42)
+
+    # 2. 如果漏洞进行了增强，安全也必须进行增强
+    if vul_aug_used > 0:
+        # 找出未被抽取作为 base 的剩余安全样本，作为增强的“种子”
+        remaining_safe = df_safe.drop(base_safe.index)
+        # 选取一部分种子进行混淆 (不需要全用，选一批代表即可)
+        seed_safe = remaining_safe.sample(n=min(len(remaining_safe), 30000), random_state=42)
+        print(f"[*] 启动安全样本增强程序...")
+        aug_df_safe = augment_data(seed_safe, vul_aug_used, label_value=0)
+
+        sampled_safe = pd.concat([base_safe, aug_df_safe], ignore_index=True)
+    else:
+        sampled_safe = base_safe
+
+    # ===============================================================
+
+    # 最终合并并彻底打乱顺序
     df_final = pd.concat([sampled_safe, sampled_vul]).sample(frac=1, random_state=42).reset_index(drop=True)
 
-    print(f"[+] 训练集构建完成:")
-    print(f"    - 原生安全样本: {len(sampled_safe)}")
-    print(f"    - 原生漏洞样本: {min(real_vul_count, target_count)}")
-    print(f"    - 混淆增强漏洞: {max(0, target_count - real_vul_count)}")
+    print(f"\n[+] 训练集构建完成 (完美对称):")
+    print(f"    - 安全样本(0): {vul_original_used} 原生 + {vul_aug_used} 混淆 = {len(sampled_safe)}")
+    print(f"    - 漏洞样本(1): {vul_original_used} 原生 + {vul_aug_used} 混淆 = {len(sampled_vul)}")
     print(f"    - 总计: {len(df_final)}")
 
     return Dataset.from_pandas(df_final[['func', 'label']])
 
 
-# =============== 训练执行 (维持原样) ===============
+# =============== 训练执行 ===============
 
 def train_models(dataset):
     models_to_train = {
@@ -206,7 +218,8 @@ def train_models(dataset):
                 output_dir=f"./temp_{name}",
                 per_device_train_batch_size=16,
                 num_train_epochs=3,
-                learning_rate=5e-5,
+                # 🚀 修改 3：对于 LoRA 微调，学习率必须调大，否则无法在 3 epochs 内收敛
+                learning_rate=3e-4,
                 save_strategy="epoch",
                 report_to="none",
                 fp16=torch.cuda.is_available()
@@ -229,9 +242,8 @@ def train_models(dataset):
 
 
 if __name__ == "__main__":
-    # 路径根据实际情况修改
-    if os.path.exists("data/cleaned_dataset.parquet"):
-        ds = prepare_dataset("data/cleaned_dataset.parquet")
+    if os.path.exists("data/diverse_vul.parquet"):
+        ds = prepare_dataset("data/diverse_vul.parquet")
         train_models(ds)
     else:
         print("Dataset not found.")

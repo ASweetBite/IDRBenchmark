@@ -6,17 +6,17 @@ global:
 
 # Runtime Parameters
 run_params:
-  samples: 100
-  dataset: "./data/big_vul.parquet"
+  samples: 500
+  dataset: "./data/bigvul_polars.parquet"
   iterations: 20
   algorithm: "greedy"
   run_mode: "attack"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
-  use_majority_voting: true
+  use_majority_voting: false
 
 # Target Models
 model_zoo:
-  CodeBERT: "./models/finetuned_model_codebert_1"
+    CodeBERT: "./models/finetuned_model_codebert_1"
 
 # Candidate Generation Configurations
 lightweight_candidate:
@@ -50,7 +50,7 @@ analyzer:
 mlm_engine:
   model_name: "microsoft/codebert-base-mlm"
 smoother:
-  num_samples: 5
+  num_samples: 10
   variance_threshold: 0.05
   replace_prob: 0.5
   batch_size: 32

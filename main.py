@@ -1,16 +1,16 @@
 import argparse
-import concurrent.futures
 import random
-import yaml
+import time
 
 import numpy as np
 import torch
+import yaml
 
+from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from attacks.IRTGAttacker import IRTGAttacker
 from attacks.LightweightCandidateGenerator import LightweightCandidateGenerator
 from attacks.NormalizationAttacker import NormalizationAttacker
 from attacks.RandomAttacker import RandomAttacker
-from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset import DatasetLoader
 from utils.mlm_engine import MLMEngine
@@ -58,9 +58,21 @@ def main(args, config):
 
         for var in variables:
             try:
+                # 记录开始时间
+                start_time = time.perf_counter()
+
                 pool[var] = generator.generate_structural_candidates(
                     code_str, var, identifiers=identifiers
                 )
+
+                # 记录结束时间并计算差值
+                end_time = time.perf_counter()
+                elapsed_time = end_time - start_time
+
+                # 打印耗时和生成的候选词数量
+                print(
+                    f"[Info] Successfully generated {len(pool[var])} candidates for '{var}' in {elapsed_time:.4f} seconds.")
+
             except Exception as e:
                 print(f"[Warning] Failed to generate for {var}: {e}")
                 pool[var] = []

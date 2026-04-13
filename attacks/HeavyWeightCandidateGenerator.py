@@ -3,6 +3,7 @@ import random
 import re
 from collections import defaultdict
 from typing import List, Any
+import nltk
 import torch
 import torch.nn.functional as F
 
@@ -101,7 +102,7 @@ class HeavyWeightCandidateGenerator:
         else:
             return "".join(predicted_words)
 
-    def _get_code_embedding_batched(self, code_snippets: List[str], batch_size: int = 64) -> torch.Tensor:
+    def _get_code_embedding_batched(self, code_snippets: List[str], batch_size: int = 32) -> torch.Tensor:
         """Performs batch inference to get sequence-level embeddings for code snippets using Mean Pooling."""
         all_embeddings = []
         tokenizer = self.mlm_engine.tokenizer
@@ -317,27 +318,34 @@ class HeavyWeightCandidateGenerator:
         target_lengths = [len(p) for p in parts]
         mask_token = self.mlm_engine.tokenizer.mask_token
 
+        # ==================== 优化 1: 动态 top_k 与变体剪枝 ====================
+        # 单词数量越多，需要的 top_k 越小，因为组合产生的候选词已经足够多
+        dynamic_top_k = max(3, top_k_mlm // max(1, (n_parts - 1)))
+
         variations = []
         if strict_structure:
             variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
             if n_parts > 1:
+                # 剪枝：对于大于 3 个单词的长变量，不再穷举所有组合，只做单词替换
+                max_sub_length = n_parts if n_parts <= 3 else 2
                 for s in range(n_parts):
-                    for e in range(s + 1, n_parts + 1):
+                    for e in range(s + 1, min(s + 1 + max_sub_length, n_parts + 1)):
                         if s == 0 and e == n_parts: continue
                         variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
         else:
             variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1})
             if n_parts > 1:
                 variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
+                max_sub_length = n_parts if n_parts <= 3 else 2
                 for s in range(n_parts):
-                    for e in range(s + 1, n_parts + 1):
+                    for e in range(s + 1, min(s + 1 + max_sub_length, n_parts + 1)):
                         if s == 0 and e == n_parts: continue
                         variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': 1})
                         if (e - s) > 1:
                             variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
+        # =======================================================================
 
         cropped_codes = []
-        # ==================== 保持不变：MLM 推理用的全局大上下文 ====================
         context_half = 700
         mask_start = len(prefix)
 
@@ -363,13 +371,16 @@ class HeavyWeightCandidateGenerator:
 
                 current_cands = []
                 if var['num_masks'] == 1 and not strict_structure:
-                    words = self._decode_words(logits[0, mask_indices[0], :], top_k_mlm, allow_underscore=True)
+                    # 单一 Mask 时使用动态 top_k
+                    words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=True)
                     for w in words:
                         current_cands.append(
                             self._assemble_multi_candidate(parts, var['start'], var['end'], (w,), style, target_name))
                 else:
-                    per_mask_top_k = min(10, max(3, top_k_mlm // (var['num_masks'] * 2)))
-                    expanded_top_k = top_k_mlm * 5 if strict_structure else per_mask_top_k
+                    # ==================== 优化 2: 严格限制笛卡尔积开销 ====================
+                    # 组合越多，单位置允许的 top_k 必须越小
+                    per_mask_top_k = min(10, max(2, dynamic_top_k // var['num_masks']))
+                    expanded_top_k = dynamic_top_k * 3 if strict_structure else per_mask_top_k
                     mask_preds = []
 
                     for m_idx in range(var['num_masks']):
@@ -386,7 +397,15 @@ class HeavyWeightCandidateGenerator:
                             words = ['temp']
                         mask_preds.append(words)
 
+                    # 强制阻断组合爆炸：最大只允许生成 150 个组合
+                    MAX_COMBINATIONS = 150
+                    combo_count = 0
+
                     for combo in itertools.product(*mask_preds):
+                        if combo_count >= MAX_COMBINATIONS:
+                            break
+                        combo_count += 1
+
                         cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style,
                                                               target_name)
                         if strict_structure:
@@ -394,6 +413,7 @@ class HeavyWeightCandidateGenerator:
                                 current_cands.append(cand)
                         else:
                             current_cands.append(cand)
+                    # =======================================================================
 
                 if var['type'] == 'full':
                     raw_full_cands.extend(current_cands)
