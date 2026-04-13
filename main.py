@@ -61,7 +61,7 @@ def main(args, config):
                 # 记录开始时间
                 start_time = time.perf_counter()
 
-                pool[var] = generator.generate_structural_candidates(
+                pool[var] = generator.generate_candidates(
                     code_str, var, identifiers=identifiers
                 )
 
