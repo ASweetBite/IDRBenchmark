@@ -1,82 +1,141 @@
-import os
-import sys
-from collections import defaultdict
+import torch
+import torch.nn.functional as F
+import yaml
+from yaml import parser
 
-# 假设你的文件结构如下，确保路径能正确导入
-from utils.ast_tools import IdentifierAnalyzer
 from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
+from utils.ast_tools import IdentifierAnalyzer
+from utils.mlm_engine import MLMEngine
 
 
-def test_visualization():
-    # 1. 初始化工具
-    # 注意：这里的 model_zoo 可以传入 None 或 Mock，因为我们主要测试结构逻辑
-    # 如果 generate_structural_candidates 内部需要 MLM 词汇，请确保已经有基础词库
-    analyzer = IdentifierAnalyzer(lang="cpp")
-    generator = HeavyWeightCandidateGenerator(mlm_engine=None, analyzer=analyzer)
+def evaluate_and_print_candidates(generator, code_str: str, target_name: str):
+    """
+    调用生成器获取候选词，并计算打印它们与原变量的代码级上下文相似度。
+    """
+    print(f"[*] 开始为变量 '{target_name}' 生成候选词...")
 
-    # 2. 准备测试用例：覆盖各种复杂的命名场景
-    test_cases = [
-        "ResReturnBuf",  # PascalCase [3, 6, 3]
-        "user_login_count",  # snake_case [4, 5, 5]
-        "_ptrIdx",  # camelCase [3, 3] 带下划线前缀
-        "__init_data",  # snake_case [4, 4] 带双下划线
-        "mixed_StyleName",  # 混合风格 (根据你的要求，应走 snake_case)
-        "data2_ptr",  # 带数字的下划线
-        "i",  # 单字母
-    ]
+    # 1. 调用你封装好的候选词生成方法
+    candidates = generator.generate_candidates(code_str, target_name)
 
-    # 3. 模拟一个词库 (优化 A 的体现)
-    # 在实际运行中，这些词应该来自 MLM 或本地代码
-    mock_mlm_seeds = [
-        "get", "set", "val", "ptr", "data", "info", "buffer", "process",
-        "result", "index", "item", "handle", "status", "output", "input"
-    ]
-    # 手动填充一下 generator 的词库，防止生成的列表为空
-    generator.local_pool = generator._build_length_pool(mock_mlm_seeds, [])
+    if not candidates:
+        print(f"[-] 未能为 '{target_name}' 生成任何有效候选词。")
+        return
 
-    # 4. 打印表头
-    header = f"{'Original Name':<20} | {'Generated Candidate':<20} | {'Style':<12} | {'Lengths':<12} | {'Status'}"
-    print("\n" + "=" * 85)
-    print(header)
-    print("-" * 85)
+    # 2. 获取语法树标识符，以提取目标变量的字节起始位置
+    code_bytes = code_str.encode('utf-8')
+    identifiers = generator.analyzer.extract_identifiers(code_bytes)
 
-    dummy_code = "void dummy() { int " + ", ".join(test_cases) + "; }"
+    if target_name not in identifiers:
+        print(f"[-] AST 提取失败：语法树中未找到变量 {target_name}")
+        return
 
-    for original in test_cases:
-        # 获取原词格式信息
-        orig_info = analyzer.analyze_format(original)
+    target_info = identifiers[target_name][0]
 
-        # 生成候选词
-        # 注意：确保你的 generator 类中有这个方法
-        candidates = generator.generate_structural_candidates(dummy_code, original, top_n_keep=10)
+    # 3. 复用你的 AST 局部切片方法，获取原句的 prefix 和 suffix
+    local_prefix, local_suffix = generator._extract_local_context_ast(
+        code_bytes,
+        target_info['start'],
+        target_info['end']
+    )
 
-        if not candidates:
-            print(
-                f"{original:<20} | {'[No Candidates]':<20} | {orig_info['style']:<12} | {str(orig_info['lengths']):<12} | ⚠️")
-            continue
+    # 4. 组装原代码片段，并获取 Original Embedding
+    original_local_str = local_prefix + target_name + local_suffix
+    orig_emb = generator._get_code_embedding_batched([original_local_str])
+    orig_emb = orig_emb.to(generator.mlm_engine.device)
 
-        for i, cand in enumerate(candidates):
-            cand_info = analyzer.analyze_format(cand)
+    # 5. 组装所有候选词替换后的代码片段
+    cand_codes = [local_prefix + cand + local_suffix for cand in candidates]
 
-            # 验证逻辑
-            style_ok = orig_info['style'] == cand_info['style']
-            len_ok = orig_info['lengths'] == cand_info['lengths']
-            prefix_ok = orig_info['prefix'] == cand_info['prefix']
+    # 6. 批量获取所有候选代码的 Embedding
+    cand_embs = generator._get_code_embedding_batched(cand_codes)
+    cand_embs = cand_embs.to(generator.mlm_engine.device)
 
-            status = "✅" if (style_ok and len_ok and prefix_ok) else "❌"
+    # 7. 计算 Cosine Similarity
+    sims = F.cosine_similarity(orig_emb, cand_embs)
 
-            # 第一行显示原名，后续行留空以便阅读
-            display_name = original if i == 0 else ""
-            print(
-                f"{display_name:<20} | {cand:<20} | {cand_info['style']:<12} | {str(cand_info['lengths']):<12} | {status}")
+    # 8. 整合数据并按相似度降序排序
+    results = []
+    for cand, sim in zip(candidates, sims):
+        results.append((cand, sim.item()))
 
-        print("-" * 85)
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    # 9. 格式化输出结果
+    print(f"\n[+] '{target_name}' 的 Top-{len(results)} 候选词及语义相似度:")
+    print("-" * 65)
+    print(f"{'候选词 (Candidate)':<35} | {'代码级相似度 (Cosine)':<20}")
+    print("-" * 65)
+    for cand, sim in results:
+        # 高亮原变量供对比参考
+        if cand == target_name:
+            print(f"{cand:<35} | {sim:.4f} (Original)")
+        else:
+            print(f"{cand:<35} | {sim:.4f}")
+    print("-" * 65)
 
 
-if __name__ == "__main__":
-    # 模拟环境设置
+def main():
     try:
-        test_visualization()
-    except Exception as e:
-        print(f"运行失败: {e}")
-        print("请检查 ast_tools.py 是否已添加 analyze_format 方法，以及 CodeBasedCandidateGenerator.py 是否已添加相应逻辑。")
+        with open("config/config.yaml", 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+    except FileNotFoundError:
+        pass
+
+    analyzer = IdentifierAnalyzer(lang=config['analyzer']['lang'])
+    mlm_engine = MLMEngine(config['mlm_engine']['model_name'])
+
+    light_cand_config = {
+        "candidate": config['lightweight_candidate']
+    }
+
+    generator = HeavyWeightCandidateGenerator(
+        mlm_engine,
+        analyzer,
+        config=config['heavyweight_candidate']
+    )
+
+    print("--- 📥 请输入/粘贴 C/C++ 函数代码 ---")
+    print("💡 输入完成后，请在新的一行输入 'END' 并回车结束读取：")
+
+    # 1. 使用哨兵值循环读取，不触发 EOF
+    lines = []
+    while True:
+        try:
+            line = input()
+            if line.strip() == "END":
+                break
+            lines.append(line)
+        except EOFError:
+            break
+
+    source_code_str = "\n".join(lines)
+
+    if not source_code_str.strip():
+        print("未检测到输入，退出。")
+        return
+
+    code_bytes = source_code_str.encode("utf-8")
+
+    identifiers = analyzer.extract_identifiers(code_bytes)
+    if not identifiers:
+        print("未能提取到有效标识符。")
+        return
+
+    # 选择目标变量
+    target_var = max(identifiers.keys(), key=lambda k: len(identifiers[k]))
+
+    # 由于没有触发 EOF，这里的 input() 会正常工作
+    print(f"\n自动选择高频变量: '{target_var}'")
+    user_input = input("输入新变量名或按回车继续: ").strip()
+    if user_input:
+        target_var = user_input
+    scliced_code = analyzer.get_folded_code(code_bytes, target_var)
+    evaluate_and_print_candidates(generator, scliced_code, target_var)
+
+# ==========================================
+# 使用示例 (Mock 实例化流程)
+# ==========================================
+if __name__ == "__main__":
+    """Orchestrates the evaluation of model robustness against various renaming attacks."""
+
+    main()

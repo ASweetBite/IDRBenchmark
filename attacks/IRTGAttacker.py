@@ -64,8 +64,7 @@ class IRTGAttacker:
                 probs, pred = self.model_zoo.predict(code, m)
                 orig_predictions[m] = {"probs": probs, "pred": pred}
 
-            raw_variables = self.attacker_params["get_all_vars_fn"](code)
-            variables = [v for v in raw_variables if not v.isupper() and not v.startswith(("av_", "spapr_", "kvm"))]
+            variables = self.attacker_params["get_all_vars_fn"](code)
 
             subs_pool = self.attacker_params["get_subs_pool_fn"](code, variables)
             for var in list(subs_pool.keys()):

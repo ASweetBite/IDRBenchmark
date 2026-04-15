@@ -1,14 +1,22 @@
 import itertools
+import os
 import random
 import re
 from collections import defaultdict
 from typing import List, Any
-import nltk
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from utils.ast_tools import CodeTransformer
 
+try:
+    from sentence_transformers import SentenceTransformer
+    _ST_AVAILABLE = True
+except ImportError:
+    _ST_AVAILABLE = False
+    print("[-] Warning: sentence-transformers not installed.")
 
 class HeavyWeightCandidateGenerator:
     """Generates context-aware identifier candidates using Masked Language Modeling and AST validation."""
@@ -19,6 +27,28 @@ class HeavyWeightCandidateGenerator:
         self.analyzer = analyzer
         self._embedding_cache = {}
         self.config = config
+
+        self.minilm_model = None
+        if _ST_AVAILABLE:
+            # 从配置中读取本地路径，如果没有则给一个空字符串
+            minilm_path = self.config.get("minilm_model_path", "")
+
+            if minilm_path:
+                # 动态转为绝对路径（防止终端运行目录不同导致找不到文件）
+                if not os.path.isabs(minilm_path):
+                    base_dir = os.getcwd()
+                    minilm_path = os.path.join(base_dir, minilm_path)
+
+                print(f"[*] 准备从本地加载 MiniLM 模型: {minilm_path}")
+
+                if os.path.exists(minilm_path):
+                    # 直接传入本地文件夹的路径，SentenceTransformer 会自动识别并加载
+                    self.minilm_model = SentenceTransformer(minilm_path, device='cpu')
+                    print("[+] 本地 MiniLM 模型加载成功！")
+                else:
+                    print(f"[-] 警告: 找不到本地 MiniLM 模型路径 {minilm_path}，请先运行下载脚本！")
+            else:
+                print("[-] 警告: 配置中未设置 minilm_model_path，跳过加载 MiniLM。")
 
     def _detect_naming_style(self, name: str) -> str:
         """Determines the naming convention of a given identifier string."""
@@ -39,24 +69,12 @@ class HeavyWeightCandidateGenerator:
         cand_style = self._detect_naming_style(candidate)
         if original_style in ('snake_case', 'camelCase', 'PascalCase') and cand_style == 'single_lower':
             return True
+        if original_style == 'single_lower' and cand_style in ('snake_case', 'camelCase'):
+            return True
+        if original_style == 'single_upper' and cand_style == 'SCREAMING_SNAKE':
+            return True
+
         return cand_style == original_style
-
-    def _get_word_embedding(self, word: str) -> Any | None:
-        """Retrieves and caches word embeddings from the MLM engine, ensuring CPU offloading."""
-        if word in self._embedding_cache:
-            return self._embedding_cache[word]
-
-        tokenizer = self.mlm_engine.tokenizer
-        tokens = tokenizer(word, add_special_tokens=False, return_tensors="pt").input_ids[0]
-        if len(tokens) == 0:
-            return None
-        tokens = tokens.to(self.mlm_engine.device)
-        with torch.no_grad():
-            embeddings = self.mlm_engine.model.get_input_embeddings()(tokens)
-
-        emb_mean = embeddings.mean(dim=0).cpu().detach()
-        self._embedding_cache[word] = emb_mean
-        return emb_mean
 
     def _split_identifier(self, name: str):
         """Deconstructs an identifier into its constituent word parts based on naming style."""
@@ -179,45 +197,136 @@ class HeavyWeightCandidateGenerator:
         except Exception:
             return None
 
+    def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
+                                       batch_size: int = 32) -> torch.Tensor:
+        """
+        核心科技：计算带有上下文的 Token 级变量语义向量，抛弃整句噪音。
+        精准定位 BPE 分词后的变量边界，彻底解决分数拥挤和缩写识别问题。
+        """
+        all_embeddings = []
+        tokenizer = self.mlm_engine.tokenizer
+
+        full_texts = [p + v + s for p, v, s in zip(prefixes, var_names, suffixes)]
+
+        for i in range(0, len(full_texts), batch_size):
+            batch_texts = full_texts[i: i + batch_size]
+            batch_prefixes = prefixes[i: i + batch_size]
+            batch_vars = var_names[i: i + batch_size]
+
+            inputs = tokenizer(
+                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=512
+            ).to(self.mlm_engine.device)
+
+            with torch.no_grad():
+                outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
+                last_hidden = outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
+
+            for b_idx in range(len(batch_texts)):
+                # 利用 BPE 序列匹配法，精准找到变量在句子中的 Token 索引
+                p_tokens = tokenizer.encode(batch_prefixes[b_idx], add_special_tokens=False)
+                pv_tokens = tokenizer.encode(batch_prefixes[b_idx] + batch_vars[b_idx], add_special_tokens=False)
+
+                shared_len = 0
+                for pt, pvt in zip(p_tokens, pv_tokens):
+                    if pt == pvt:
+                        shared_len += 1
+                    else:
+                        break
+
+                # 定位变量 Token 的起止位置 (考虑 [CLS] 占据的 index 0)
+                start_idx = shared_len + 1
+                end_idx = len(pv_tokens) + 1
+
+                # 边界安全拦截
+                start_idx = min(start_idx, 511)
+                end_idx = min(max(start_idx + 1, end_idx), 512)
+                var_tokens_str = tokenizer.convert_ids_to_tokens(pv_tokens[shared_len:])
+                print(f"[Align Debug] Variable '{batch_vars[b_idx]}' aligned to tokens: {var_tokens_str}")
+                # 精准抠出属于这个变量的所有 sub-token 向量，并做局部池化
+                target_hiddens = last_hidden[b_idx, start_idx:end_idx, :]
+                pooled = target_hiddens.mean(dim=0)
+
+                all_embeddings.append(pooled.cpu().detach())
+
+        return torch.stack(all_embeddings)
+
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
-        """Filters candidates based on contextual semantic similarity, naming style, and keyword conflicts."""
-        filtered_cands = []
+        # 获取基础语义阈值（假设配置中设为 0.85）
+        base_threshold = ctx.get('semantic_threshold', 0.85)
+
+        # 预过滤：基础检查
+        base_cands = []
         for cand in candidate_list:
             if cand in ctx['keywords'] or cand == ctx['target_name']: continue
             if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
-            filtered_cands.append(cand)
+            base_cands.append(cand)
 
+        # 核心环节：Token-Level 语义过滤
         semantically_valid = []
-        if not is_full_context and ctx['semantic_threshold'] > 0 and ctx['original_code_emb'] is not None:
-            cand_codes = []
-            valid_cands_temp = []
+        if base_cands and base_threshold > 0:
+            # 1. 提取原变量 Token 向量
+            orig_emb = self._get_variable_token_embeddings(
+                [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
+            ).to(self.mlm_engine.device)
 
-            for cand in filtered_cands:
-                # 【修复此处】：使用 local_prefix 和 local_suffix 拼接替换后的 AST 切片
-                replaced_code = ctx['local_prefix'] + cand + ctx['local_suffix']
-                cand_codes.append(replaced_code)
-                valid_cands_temp.append(cand)
+            # 2. 批量提取候选词 Token 向量
+            prefixes = [ctx['local_prefix']] * len(base_cands)
+            suffixes = [ctx['local_suffix']] * len(base_cands)
+            cand_embs = self._get_variable_token_embeddings(prefixes, base_cands, suffixes).to(self.mlm_engine.device)
 
-            if cand_codes:
-                # Get embeddings for all candidate code variations
-                cand_embs = self._get_code_embedding_batched(cand_codes)
-                cand_embs = cand_embs.to(self.mlm_engine.device)
-                orig_tensor = ctx['original_code_emb'].to(self.mlm_engine.device)
+            # 3. 计算相似度
+            sims = F.cosine_similarity(orig_emb, cand_embs)
 
-                # Compare entire snippet semantics
-                sims = F.cosine_similarity(orig_tensor, cand_embs)
+            print(f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Base Threshold: {base_threshold}):")
+            print(f"{'Candidate':<20} | {'Token Sim':<10} | {'Dyn Thresh':<10} | {'Status'}")
+            print("-" * 65)
 
-                for cand, sim in zip(valid_cands_temp, sims):
-                    if sim.item() >= ctx['semantic_threshold']:
-                        semantically_valid.append(cand)
+            target_name = ctx['target_name']
+            target_parts, _ = self._split_identifier(target_name)
+
+            for cand, sim in zip(base_cands, sims):
+                score = sim.item()
+
+                # ==================== 新增：动态阈值调整引擎 ====================
+                current_threshold = base_threshold
+                cand_parts, _ = self._split_identifier(cand)
+
+                # 仅针对目标变量是单字的情况进行动态适应
+                if len(target_parts) == 1:
+                    if len(cand_parts) > 1:
+                        # 发生了扩充 (生成了两个及以上的词汇)
+                        if target_name.lower() in [p.lower() for p in cand_parts]:
+                            # 模式 1: 保留了原词的扩充 (如 vma_cache) -> 天生分高，严格卡死 (+0.10)
+                            current_threshold = min(0.98, base_threshold + 0.10)
+                        else:
+                            # 模式 2: 未保留原词的扩充 (如 mem_area) -> 分数稍高，适当收紧 (+0.05)
+                            current_threshold = min(0.95, base_threshold + 0.05)
+                    else:
+                        # 模式 3: 非扩充，依然是单字替换 (如 area)
+                        # 如果单词特别短（长度 <= 3），为了防止被误杀，甚至可以考虑微调降低阈值
+                        if len(cand) <= 3:
+                            current_threshold = max(0.50, base_threshold - 0.15)
+                        else:
+                            current_threshold = base_threshold
+                # ================================================================
+
+                is_pass = score >= current_threshold
+                status = "[PASS]" if is_pass else "[FILTERED]"
+
+                # 格式化输出以供调试
+                print(f"{cand:<20} | {score:.4f}{' ':<4} | {current_threshold:.4f}{' ':<4} | {status}")
+
+                if is_pass:
+                    semantically_valid.append(cand)
+            print("-" * 65 + "\n")
         else:
-            semantically_valid = filtered_cands
+            semantically_valid = base_cands
 
+        # 最终的 AST 验证逻辑
         added = 0
         for cand in semantically_valid:
             if added >= quota:
                 break
-
             valid_cand = self._verify_ast_single(cand, ctx)
             if valid_cand and valid_cand not in final_candidates:
                 final_candidates.append(valid_cand)
@@ -277,14 +386,21 @@ class HeavyWeightCandidateGenerator:
                        top_k_mlm: int, top_n_keep: int, semantic_threshold: float,
                        context_ratio: float, preserve_style: bool, strict_structure: bool) -> List[str]:
         """Orchestrates the candidate generation process including masking, batch inference, and filtering."""
-        if len(target_name.strip('_')) <= 1: return []
+        stripped_name = target_name.strip('_')
+        if len(stripped_name) == 0: return []
         if target_name.startswith('__') and target_name.endswith('__'): return []
 
         code_bytes = code.encode("utf-8")
         if identifiers is None:
             identifiers = self.analyzer.extract_identifiers(code_bytes)
-
         if target_name not in identifiers: return []
+
+        if len(stripped_name) == 1:
+            min_freq = self.config.get('min_freq_for_single_char', 3)
+            occurrence_count = len(identifiers[target_name])
+
+            if occurrence_count < min_freq:
+                return []
 
         original_style = self._detect_naming_style(target_name)
 
@@ -293,22 +409,17 @@ class HeavyWeightCandidateGenerator:
         prefix = code_bytes[:target_info['start']]
         suffix = code_bytes[target_info['end']:]
 
-        # ==================== 新增：基于 AST 提取局部切片 ====================
         # 获取用于计算相似度的精确语句级上下文
         local_prefix, local_suffix = self._extract_local_context_ast(
-            code_bytes,
-            target_info['start'],
-            target_info['end']
+            code_bytes, target_info['start'], target_info['end']
         )
 
         original_code_emb = None
         if semantic_threshold > 0:
-            # 组装原始的完整语句，并获取它的 Embedding
             original_local_str = local_prefix + target_name + local_suffix
             original_code_emb = self._get_code_embedding_batched([original_local_str])
             if original_code_emb is not None:
                 original_code_emb = original_code_emb.to(self.mlm_engine.device)
-        # =====================================================================
 
         parts, style = self._split_identifier(target_name)
         n_parts = len(parts)
@@ -318,32 +429,40 @@ class HeavyWeightCandidateGenerator:
         target_lengths = [len(p) for p in parts]
         mask_token = self.mlm_engine.tokenizer.mask_token
 
-        # ==================== 优化 1: 动态 top_k 与变体剪枝 ====================
-        # 单词数量越多，需要的 top_k 越小，因为组合产生的候选词已经足够多
         dynamic_top_k = max(3, top_k_mlm // max(1, (n_parts - 1)))
 
         variations = []
-        if strict_structure:
-            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
+
+        # ==================== 单词变量的扩充机制 ====================
+        if n_parts == 1 and not strict_structure:
+            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'none'})
+            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'prefix'})
+            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'suffix'})
+            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 2, 'expand_mode': 'both'})
+
+        # ==================== 复合词变体生成 ====================
+        elif strict_structure:
+            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts, 'expand_mode': 'none'})
             if n_parts > 1:
-                # 剪枝：对于大于 3 个单词的长变量，不再穷举所有组合，只做单词替换
                 max_sub_length = n_parts if n_parts <= 3 else 2
                 for s in range(n_parts):
                     for e in range(s + 1, min(s + 1 + max_sub_length, n_parts + 1)):
                         if s == 0 and e == n_parts: continue
-                        variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
+                        variations.append(
+                            {'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s, 'expand_mode': 'none'})
         else:
-            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1})
+            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1, 'expand_mode': 'none'})
             if n_parts > 1:
-                variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts})
+                variations.append(
+                    {'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts, 'expand_mode': 'none'})
                 max_sub_length = n_parts if n_parts <= 3 else 2
                 for s in range(n_parts):
                     for e in range(s + 1, min(s + 1 + max_sub_length, n_parts + 1)):
                         if s == 0 and e == n_parts: continue
-                        variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': 1})
+                        variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': 1, 'expand_mode': 'none'})
                         if (e - s) > 1:
-                            variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s})
-        # =======================================================================
+                            variations.append(
+                                {'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s, 'expand_mode': 'none'})
 
         cropped_codes = []
         context_half = 700
@@ -353,8 +472,19 @@ class HeavyWeightCandidateGenerator:
         suffix_str = suffix[:context_half].decode("utf-8", errors="replace")
 
         for var in variations:
-            masked_var = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style, mask_token,
-                                                   target_name)
+            expand_mode = var.get('expand_mode', 'none')
+
+            # 根据模式构造带下划线的特殊 Mask
+            if expand_mode == 'none':
+                masked_var = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style,
+                                                       mask_token, target_name)
+            elif expand_mode == 'prefix':
+                masked_var = f"{mask_token}_{target_name}"
+            elif expand_mode == 'suffix':
+                masked_var = f"{target_name}_{mask_token}"
+            elif expand_mode == 'both':
+                masked_var = f"{mask_token}_{mask_token}"
+
             cropped_code = prefix_str + masked_var + suffix_str
             cropped_codes.append(cropped_code)
 
@@ -366,19 +496,45 @@ class HeavyWeightCandidateGenerator:
             for i, var in enumerate(variations):
                 logits = batch_logits[i:i + 1]
                 mask_indices = batch_mask_indices[i]
+                expand_mode = var.get('expand_mode', 'none')
 
                 if len(mask_indices) < var['num_masks']: continue
 
                 current_cands = []
-                if var['num_masks'] == 1 and not strict_structure:
-                    # 单一 Mask 时使用动态 top_k
+
+                # ==================== 处理扩充模式的候选词组装 ====================
+                if expand_mode != 'none':
+                    if expand_mode == 'prefix':
+                        words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
+                        print(f"[Debug] 前缀模式生成词汇: {words[:5]}...")
+                        for w in words: current_cands.append(f"{w}_{target_name}")
+
+                    elif expand_mode == 'suffix':
+                        words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
+                        print(f"[Debug] 后缀模式生成词汇: {words[:5]}...")
+                        for w in words: current_cands.append(f"{target_name}_{w}")
+
+                    elif expand_mode == 'both':
+                        per_mask_top_k = max(2, dynamic_top_k // 2)
+                        words1 = self._decode_words(logits[0, mask_indices[0], :], per_mask_top_k,
+                                                    allow_underscore=False)
+                        words2 = self._decode_words(logits[0, mask_indices[1], :], per_mask_top_k,
+                                                    allow_underscore=False)
+
+                        MAX_EXPAND_COMBOS = 50
+                        combo_count = 0
+                        for w1, w2 in itertools.product(words1, words2):
+                            if combo_count >= MAX_EXPAND_COMBOS: break
+                            current_cands.append(f"{w1}_{w2}")
+                            combo_count += 1
+
+                # ==================== 原有的非扩充模式组装 ====================
+                elif var['num_masks'] == 1 and not strict_structure:
                     words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=True)
                     for w in words:
                         current_cands.append(
                             self._assemble_multi_candidate(parts, var['start'], var['end'], (w,), style, target_name))
                 else:
-                    # ==================== 优化 2: 严格限制笛卡尔积开销 ====================
-                    # 组合越多，单位置允许的 top_k 必须越小
                     per_mask_top_k = min(10, max(2, dynamic_top_k // var['num_masks']))
                     expanded_top_k = dynamic_top_k * 3 if strict_structure else per_mask_top_k
                     mask_preds = []
@@ -386,7 +542,6 @@ class HeavyWeightCandidateGenerator:
                     for m_idx in range(var['num_masks']):
                         part_idx = var['start'] + m_idx if strict_structure else None
                         req_len = target_lengths[part_idx] if strict_structure else None
-
                         words = self._decode_words(logits[0, mask_indices[m_idx], :], expanded_top_k,
                                                    allow_underscore=False, required_length=req_len)
                         words = words[:per_mask_top_k]
@@ -397,15 +552,11 @@ class HeavyWeightCandidateGenerator:
                             words = ['temp']
                         mask_preds.append(words)
 
-                    # 强制阻断组合爆炸：最大只允许生成 150 个组合
                     MAX_COMBINATIONS = 150
                     combo_count = 0
-
                     for combo in itertools.product(*mask_preds):
-                        if combo_count >= MAX_COMBINATIONS:
-                            break
+                        if combo_count >= MAX_COMBINATIONS: break
                         combo_count += 1
-
                         cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style,
                                                               target_name)
                         if strict_structure:
@@ -413,7 +564,6 @@ class HeavyWeightCandidateGenerator:
                                 current_cands.append(cand)
                         else:
                             current_cands.append(cand)
-                    # =======================================================================
 
                 if var['type'] == 'full':
                     raw_full_cands.extend(current_cands)
@@ -431,16 +581,14 @@ class HeavyWeightCandidateGenerator:
                         seen_sub.add(lst[j])
                         unique_sub.append(lst[j])
 
-        # ==================== 新增：传入 local_prefix 等参数供相似度验证使用 ====================
         ctx = {
             'code_bytes': code_bytes, 'target_name': target_name, 'identifiers': identifiers,
             'keywords': self.analyzer.keywords, 'original_style': original_style,
-            'original_code_emb': original_code_emb,     # 替换了原来的 original_emb
-            'local_prefix': local_prefix,               # 传入 AST 切片前缀
-            'local_suffix': local_suffix,               # 传入 AST 切片后缀
+            'original_code_emb': original_code_emb,
+            'local_prefix': local_prefix,
+            'local_suffix': local_suffix,
             'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style
         }
-        # ========================================================================================
 
         final_candidates = []
         target_full_quota = int(top_n_keep * context_ratio)

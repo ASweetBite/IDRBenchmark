@@ -28,8 +28,9 @@ lightweight_candidate:
 heavyweight_candidate:
   top_k_mlm: 60
   top_n_keep: 50
-  semantic_threshold: 0.2
+  semantic_threshold: 0.85
   structural_semantic_threshold: 0.5
+  minilm_model_path: "models/all-MiniLM-L6-v2"
   context_ratio: 0.3
   preserve_style: true
 

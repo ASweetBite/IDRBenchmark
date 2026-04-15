@@ -2,7 +2,8 @@ import re
 from collections import defaultdict
 from typing import Union
 
-from tree_sitter import Language, Parser
+from tree_sitter import Language
+from tree_sitter import Parser
 
 
 class IdentifierAnalyzer:
@@ -32,6 +33,33 @@ class IdentifierAnalyzer:
             "int32_t", "uint32_t", "int64_t", "uint64_t", "EOF"
         }
 
+        # [性能优化] 预先将 keywords 转换为 bytes，避免在遍历时对每个标识符进行耗时的 decode 操作
+        self.keywords_bytes = {k.encode("utf-8") for k in self.keywords}
+
+        # [性能优化] 预编译 Tree-sitter S-expression Query
+        # 将原本需要在 Python 中递归的成千上万个节点，下放给底层的 C 引擎直接过滤出我们关心的节点
+        query_str = """
+        [
+            (compound_statement)
+            (class_specifier)
+            (namespace_definition)
+            (struct_specifier)
+            (function_definition)
+            (for_statement)
+        ] @scope
+
+        [
+            (identifier)
+            (field_identifier)
+        ] @ident
+        """
+        # 兼容新老版本的 tree-sitter python binding
+        try:
+            from tree_sitter import Query
+            self.ast_query = Query(self.language, query_str)
+        except ImportError:
+            self.ast_query = self.language.query(query_str)
+
     def extract_identifiers(self, source_code: bytes) -> dict:
         """Traverses the AST to extract non-keyword identifiers and their scope information."""
         parser = Parser()
@@ -48,15 +76,6 @@ class IdentifierAnalyzer:
         }]
         scope_counter = 0
 
-        scope_nodes = {
-            'compound_statement',
-            'class_specifier',
-            'namespace_definition',
-            'struct_specifier',
-            'function_definition',
-            'for_statement'
-        }
-
         excluded_parents = {
             'preproc_def',
             'preproc_function_def',
@@ -70,14 +89,37 @@ class IdentifierAnalyzer:
             'operator_name'
         }
 
-        def traverse(node):
-            nonlocal scope_counter
+        # 1. 核心提速：使用 C 引擎一次性找出所有相关的 scope 和 标识符节点
+        if hasattr(self.ast_query, "captures"):
+            captures = self.ast_query.captures(tree.root_node)
+        else:
+            from tree_sitter import QueryCursor
+            cursor = QueryCursor(self.ast_query)
+            captures = cursor.captures(tree.root_node)
 
-            entered_scope = False
-            scope_name = ""
+            # 兼容不同版本 tree-sitter 返回格式，统一转换为 [(node, tag)] 格式
+        if isinstance(captures, dict):
+            # 某些旧版本返回 {tag: [node1, node2]}
+            flat_captures = [(node, tag) for tag, nodes in captures.items() for node in
+                             (nodes if isinstance(nodes, list) else [nodes])]
+        else:
+            # 新版本 QueryCursor 通常返回生成器或元组列表 [(node, tag)]
+            flat_captures = list(captures)
 
-            if node.type in scope_nodes:
+        # 2. 排序保证逻辑严格一致：按起始字节升序，结束字节降序
+        # 这样确保父作用域节点总是先于其内部的标识符被处理，完美模拟先序遍历
+        flat_captures.sort(key=lambda x: (x[0].start_byte, -x[0].end_byte))
+
+        # 3. 线性遍历过滤后的目标节点
+        for node, tag in flat_captures:
+
+            # 动态维护 Scope 栈：如果当前节点的起始位置超出了栈顶作用域的结束位置，说明离开了该作用域
+            while len(scope_stack) > 1 and scope_stack[-1]["end"] <= node.start_byte:
+                scope_stack.pop()
+
+            if tag == "scope":
                 scope_counter += 1
+                scope_name = ""
                 if node.type in ['class_specifier', 'struct_specifier', 'namespace_definition']:
                     name_node = node.child_by_field_name('name')
                     if name_node:
@@ -90,75 +132,75 @@ class IdentifierAnalyzer:
                     "type": node.type,
                     "name": scope_name
                 })
-                entered_scope = True
 
-            if node.type in ["identifier", "field_identifier"]:
+            elif tag == "ident":
+                # 字节级短路验证：极大减少不必要的 UTF-8 解码开销
+                name_bytes = source_code[node.start_byte:node.end_byte]
+                if name_bytes in self.keywords_bytes:
+                    continue
+
                 parent_type = node.parent.type if node.parent else None
-                name = source_code[node.start_byte:node.end_byte].decode("utf-8")
 
                 if node.parent and node.parent.type in forbidden_node_types:
-                    pass
-                elif name not in self.keywords and parent_type not in excluded_parents:
+                    continue
+                if parent_type in excluded_parents:
+                    continue
 
-                    is_func_decl = False
-                    curr = node.parent
-                    while curr and curr.type in ['qualified_identifier', 'pointer_declarator', 'reference_declarator',
-                                                 'parenthesized_declarator']:
-                        curr = curr.parent
-                    if curr and curr.type == "function_declarator":
-                        is_func_decl = True
+                # 确认是目标变量后，再进行解码
+                name = name_bytes.decode("utf-8")
 
-                    is_constructor = False
+                is_func_decl = False
+                curr = node.parent
+                while curr and curr.type in ['qualified_identifier', 'pointer_declarator', 'reference_declarator',
+                                             'parenthesized_declarator']:
+                    curr = curr.parent
+                if curr and curr.type == "function_declarator":
+                    is_func_decl = True
 
-                    if node.parent and node.parent.type == "qualified_identifier":
-                        scope_node = node.parent.child_by_field_name('scope')
-                        name_node = node.parent.child_by_field_name('name')
-                        if scope_node and name_node and node == name_node:
-                            scope_text = source_code[scope_node.start_byte:scope_node.end_byte].decode("utf-8")
-                            scope_basename = scope_text.split("::")[-1]
-                            if scope_basename == name:
+                is_constructor = False
+
+                if node.parent and node.parent.type == "qualified_identifier":
+                    scope_node = node.parent.child_by_field_name('scope')
+                    name_node = node.parent.child_by_field_name('name')
+                    if scope_node and name_node and node == name_node:
+                        scope_text = source_code[scope_node.start_byte:scope_node.end_byte].decode("utf-8")
+                        scope_basename = scope_text.split("::")[-1]
+                        if scope_basename == name:
+                            is_constructor = True
+
+                if is_func_decl and not is_constructor:
+                    for scope in reversed(scope_stack):
+                        if scope["type"] in ['class_specifier', 'struct_specifier']:
+                            if name == scope["name"]:
                                 is_constructor = True
+                            break
 
-                    if is_func_decl and not is_constructor:
-                        for scope in reversed(scope_stack):
-                            if scope["type"] in ['class_specifier', 'struct_specifier']:
-                                if name == scope["name"]:
-                                    is_constructor = True
-                                break
+                is_method_call = (
+                        node.type == "field_identifier" and
+                        node.parent and node.parent.type == "field_expression" and
+                        node.parent.parent and node.parent.parent.type == "call_expression"
+                )
 
-                    is_method_call = (
-                            node.type == "field_identifier" and
-                            node.parent and node.parent.type == "field_expression" and
-                            node.parent.parent and node.parent.parent.type == "call_expression"
-                    )
+                is_func_call = (
+                        parent_type == "call_expression" and
+                        node.parent.child_by_field_name('function') == node
+                )
 
-                    is_func_call = (
-                            parent_type == "call_expression" and
-                            node.parent.child_by_field_name('function') == node
-                    )
+                entity_type = "function" if (is_func_decl or is_func_call or is_method_call) else "variable"
 
-                    entity_type = "function" if (is_func_decl or is_func_call or is_method_call) else "variable"
+                is_plain_field = (node.type == "field_identifier" and not is_method_call and not is_func_decl)
 
-                    is_plain_field = (node.type == "field_identifier" and not is_method_call and not is_func_decl)
+                if not is_constructor and not is_plain_field:
+                    current_scope = scope_stack[-1]
+                    identifiers[name].append({
+                        "start": node.start_byte,
+                        "end": node.end_byte,
+                        "scope": current_scope["id"],
+                        "scope_start": current_scope["start"],
+                        "scope_end": current_scope["end"],
+                        "entity_type": entity_type
+                    })
 
-                    if not is_constructor and not is_plain_field:
-                        current_scope = scope_stack[-1]
-                        identifiers[name].append({
-                            "start": node.start_byte,
-                            "end": node.end_byte,
-                            "scope": current_scope["id"],
-                            "scope_start": current_scope["start"],
-                            "scope_end": current_scope["end"],
-                            "entity_type": entity_type
-                        })
-
-            for child in node.children:
-                traverse(child)
-
-            if entered_scope:
-                scope_stack.pop()
-
-        traverse(tree.root_node)
         return dict(identifiers)
 
     def get_identifier_scope_ranges(self, source_code: bytes, var_name: str):
@@ -244,36 +286,233 @@ class IdentifierAnalyzer:
         func_counter = 1
         renaming_map = {}
 
-        # 排序以保证相同的代码片段每次规范化的结果一致（Deterministic）
         for name in sorted(identifiers.keys()):
-            # 取该标识符第一次出现的信息，判断它是函数还是变量
             entity_info = identifiers[name][0]
             entity_type = entity_info.get("entity_type", "variable")
 
             if entity_type == "function":
-                # 防止源码中本身就有 FUNC1 导致命名冲突
                 while f"FUNC{func_counter}" in identifiers:
                     func_counter += 1
                 renaming_map[name] = f"FUNC{func_counter}"
                 func_counter += 1
             else:
-                # 防止源码中本身就有 VAR1 导致命名冲突
                 while f"VAR{var_counter}" in identifiers:
                     var_counter += 1
                 renaming_map[name] = f"VAR{var_counter}"
                 var_counter += 1
 
         try:
-            # 使用现有的 CodeTransformer 进行安全替换
-            # 传入 analyzer=None 绕过严格的范围校验，强制执行全局替换
             canonical_code = CodeTransformer.validate_and_apply(
                 code_bytes, identifiers, renaming_map, analyzer=None
             )
             return canonical_code
         except Exception as e:
-            # 如果在极端情况下发生转换异常，作为最后防线，直接返回原码
             return code_bytes.decode("utf-8")
 
+    def _get_enclosing_statement(self, node):
+        """
+        向上遍历 AST，寻找包含当前节点的完整语句（Statement）。
+        当父节点是作用域块或控制流语句头部时停止，当前节点即为最小完整语句级切片。
+        """
+        curr = node
+        stop_parent_types = {
+            'compound_statement',
+            'translation_unit',
+            'for_statement',
+            'while_statement',
+            'if_statement',
+            'switch_statement',
+            'function_definition'
+        }
+
+        while curr.parent:
+            if curr.parent.type in stop_parent_types:
+                break
+            curr = curr.parent
+        return curr
+
+    def get_folded_code(self, source_code: bytes, target_var: str) -> str:
+        """提取数据流切片，强制闭合所有分支，并完美保留无括号单行语句和所有函数调用"""
+        from tree_sitter import Parser
+        parser = Parser()
+        parser.language = self.language
+        tree = parser.parse(source_code)
+
+        target_nodes = []
+        call_nodes = []
+
+        def find_nodes(node):
+            if node.type in ["identifier", "field_identifier"]:
+                name = source_code[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+                if name == target_var:
+                    target_nodes.append(node)
+            elif node.type == "call_expression":
+                call_nodes.append(node)
+            for child in node.children:
+                find_nodes(child)
+
+        find_nodes(tree.root_node)
+        if not target_nodes:
+            return source_code.decode("utf-8", errors="replace")
+
+        ranges_to_keep = []
+        insertions = []
+
+        def handle_control_body(body_node):
+            if not body_node:
+                return
+            if body_node.type == 'compound_statement':
+                # 已有括号：仅保留 '{' 和 '}'
+                ranges_to_keep.append((body_node.start_byte, body_node.start_byte + 1))
+                ranges_to_keep.append((body_node.end_byte - 1, body_node.end_byte))
+            elif body_node.type != 'if_statement':
+                # 无括号的单行语句：强制注入 '{' 和 '}'，并将单行语句本身保留
+                insertions.append((body_node.start_byte, b" { "))
+                insertions.append((body_node.end_byte, b" } "))
+                ranges_to_keep.append((body_node.start_byte, body_node.end_byte))
+
+        # 使用基于祖先路径的追溯法，确保所有嵌套的控制流都能精准还原头部和闭合
+        for node in target_nodes + call_nodes:
+            curr = node
+            while curr:
+                if curr.type in ['expression_statement', 'declaration', 'return_statement',
+                                 'break_statement', 'continue_statement', 'goto_statement']:
+                    ranges_to_keep.append((curr.start_byte, curr.end_byte))
+
+                elif curr.type == 'if_statement':
+                    # 提取 if 头部
+                    cond_node = curr.child_by_field_name('condition')
+                    if cond_node:
+                        ranges_to_keep.append((curr.start_byte, cond_node.end_byte))
+                    else:
+                        ranges_to_keep.append((curr.start_byte, curr.start_byte + 2))
+
+                    handle_control_body(curr.child_by_field_name('consequence'))
+
+                    alt = curr.child_by_field_name('alternative')
+                    if alt:
+                        # 只有当前追踪的变量在 else 内部时，才保留 else 关键字
+                        if node.start_byte >= alt.start_byte and node.end_byte <= alt.end_byte:
+                            for child in curr.children:
+                                if child.type == 'else':
+                                    ranges_to_keep.append((child.start_byte, child.end_byte))
+                                    break
+                            handle_control_body(alt)
+
+                elif curr.type in ['while_statement', 'for_statement', 'switch_statement']:
+                    # 提取控制流头部（精准找寻右括号）
+                    cond_node = curr.child_by_field_name('condition')
+                    if cond_node:
+                        for child in curr.children:
+                            if child.type == ')' and child.start_byte >= cond_node.end_byte:
+                                ranges_to_keep.append((curr.start_byte, child.end_byte))
+                                break
+                        else:
+                            ranges_to_keep.append((curr.start_byte, cond_node.end_byte))
+                    else:
+                        body = curr.child_by_field_name('body')
+                        if body:
+                            for child in reversed(curr.children):
+                                if child.type == ')' and child.end_byte <= body.start_byte:
+                                    ranges_to_keep.append((curr.start_byte, child.end_byte))
+                                    break
+                            else:
+                                ranges_to_keep.append((curr.start_byte, body.start_byte))
+                        else:
+                            ranges_to_keep.append((curr.start_byte, curr.end_byte))
+
+                    handle_control_body(curr.child_by_field_name('body'))
+
+                elif curr.type == 'function_definition':
+                    body = curr.child_by_field_name('body')
+                    if body and body.type == 'compound_statement':
+                        ranges_to_keep.append((curr.start_byte, body.start_byte + 1))
+                        ranges_to_keep.append((body.end_byte - 1, body.end_byte))
+                    else:
+                        ranges_to_keep.append((curr.start_byte, curr.end_byte))
+
+                curr = curr.parent
+
+        # 区间去重与合并
+        ranges_to_keep.sort(key=lambda x: x[0])
+        merged_ranges = []
+        for current in ranges_to_keep:
+            if not merged_ranges:
+                merged_ranges.append(current)
+            else:
+                last = merged_ranges[-1]
+                if current[0] <= last[1] + 15:  # 容忍 15 字节以内的空白符吞并
+                    merged_ranges[-1] = (last[0], max(last[1], current[1]))
+                else:
+                    merged_ranges.append(current)
+
+        # 注入点整理
+        unique_insertions = list(set(insertions))
+        ins_dict = {}
+        for off, txt in unique_insertions:
+            if off not in ins_dict:
+                ins_dict[off] = []
+            ins_dict[off].append(txt)
+
+        output = bytearray()
+        last_end = 0
+
+        # 重构文本，精准应用保留区间与大括号注入
+        for start, end in merged_ranges:
+            gap_insertions = [(off, txts) for off, txts in ins_dict.items() if last_end <= off <= start]
+            gap_insertions.sort(key=lambda x: x[0])
+
+            gap_cursor = last_end
+            for off, txts in gap_insertions:
+                if off - gap_cursor > 15:
+                    if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
+                        output.extend(b"\n    /* ... */\n")
+                else:
+                    output.extend(source_code[gap_cursor:off])
+                for txt in txts:
+                    output.extend(txt)
+                gap_cursor = off
+
+            if start - gap_cursor > 15:
+                if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
+                    output.extend(b"\n    /* ... */\n")
+            else:
+                output.extend(source_code[gap_cursor:start])
+
+            keep_cursor = start
+            inside_insertions = [(off, txts) for off, txts in ins_dict.items() if start < off < end]
+            inside_insertions.sort(key=lambda x: x[0])
+
+            for off, txts in inside_insertions:
+                output.extend(source_code[keep_cursor:off])
+                for txt in txts:
+                    output.extend(txt)
+                keep_cursor = off
+
+            output.extend(source_code[keep_cursor:end])
+            last_end = end
+
+        final_insertions = [(off, txts) for off, txts in ins_dict.items() if off >= last_end]
+        final_insertions.sort(key=lambda x: x[0])
+
+        gap_cursor = last_end
+        for off, txts in final_insertions:
+            if off - gap_cursor > 15:
+                if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
+                    output.extend(b"\n    /* ... */\n")
+            else:
+                output.extend(source_code[gap_cursor:off])
+            for txt in txts:
+                output.extend(txt)
+            gap_cursor = off
+
+        if len(source_code) - gap_cursor > 15:
+            if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
+                output.extend(b"\n    /* ... */\n")
+        else:
+            output.extend(source_code[gap_cursor:len(source_code)])
+
+        return output.decode("utf-8", errors="replace")
 
 def is_valid_identifier(name: str) -> bool:
     """Validates if a string follows standard C/C++ identifier naming rules."""

@@ -1,5 +1,5 @@
 
-# Adversarial Example Generation Model via Variable Renaming
+# Robustness Benchmark for Code Models Against Adversarial Attacks via Identifier Renaming
 
 ## Introduction
 This repository contains the core component of a robustness evaluation benchmark for code vulnerability detection models. By automatically generating adversarial examples through semantics-preserving variable renaming, this tool tests and evaluates the resilience of machine learning models (such as CodeBERT) against structural and semantic perturbations in source code.

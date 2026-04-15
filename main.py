@@ -50,19 +50,46 @@ def main(args, config):
         data = analyzer.extract_identifiers(code_str.encode("utf-8"))
         return [name for name in data.keys() if name != "main"]
 
+    import time
+
     def get_subs_pool_fn(code_str: str, variables: list) -> dict:
         """Generates a pool of structural candidates for the specified variables."""
         pool = {}
         code_bytes = code_str.encode("utf-8")
+
+        # 提取完整代码的标识符
         identifiers = analyzer.extract_identifiers(code_bytes)
+
+        # 1. 自动寻找最外部的函数名
+        outermost_func_name = None
+        for name, occurrences in identifiers.items():
+            for occ in occurrences:
+                # 基于你的 AST 解析逻辑，最外层函数的 scope ID 为 0 且类型为 function
+                if occ["entity_type"] == "function" and occ["scope"] == 0:
+                    outermost_func_name = name
+                    break
+            if outermost_func_name:
+                break
 
         for var in variables:
             try:
                 # 记录开始时间
                 start_time = time.perf_counter()
 
+                # 2. 判断是否是最外部函数名
+                if var == outermost_func_name:
+                    # 是最外部函数：使用完整代码，并可以安全复用之前的 identifiers
+                    target_code_str = code_str
+                    target_identifiers = identifiers
+                else:
+                    # 局部变量/内部结构：调用折叠方法获取切片代码
+                    target_code_str = analyzer.get_folded_code(code_bytes, var)
+                    # 【关键】因为代码已经被切片改变，旧的 AST 位置已失效，必须设为 None 让生成器重新解析
+                    target_identifiers = None
+
+                    # 调用候选词生成逻辑
                 pool[var] = generator.generate_candidates(
-                    code_str, var, identifiers=identifiers
+                    target_code_str, var, identifiers=target_identifiers
                 )
 
                 # 记录结束时间并计算差值
