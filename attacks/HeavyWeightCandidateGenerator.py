@@ -11,12 +11,6 @@ import torch.nn.functional as F
 
 from utils.ast_tools import CodeTransformer
 
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
-except ImportError:
-    _ST_AVAILABLE = False
-    print("[-] Warning: sentence-transformers not installed.")
 
 class HeavyWeightCandidateGenerator:
     """Generates context-aware identifier candidates using Masked Language Modeling and AST validation."""
@@ -27,28 +21,6 @@ class HeavyWeightCandidateGenerator:
         self.analyzer = analyzer
         self._embedding_cache = {}
         self.config = config
-
-        self.minilm_model = None
-        if _ST_AVAILABLE:
-            # 从配置中读取本地路径，如果没有则给一个空字符串
-            minilm_path = self.config.get("minilm_model_path", "")
-
-            if minilm_path:
-                # 动态转为绝对路径（防止终端运行目录不同导致找不到文件）
-                if not os.path.isabs(minilm_path):
-                    base_dir = os.getcwd()
-                    minilm_path = os.path.join(base_dir, minilm_path)
-
-                print(f"[*] 准备从本地加载 MiniLM 模型: {minilm_path}")
-
-                if os.path.exists(minilm_path):
-                    # 直接传入本地文件夹的路径，SentenceTransformer 会自动识别并加载
-                    self.minilm_model = SentenceTransformer(minilm_path, device='cpu')
-                    print("[+] 本地 MiniLM 模型加载成功！")
-                else:
-                    print(f"[-] 警告: 找不到本地 MiniLM 模型路径 {minilm_path}，请先运行下载脚本！")
-            else:
-                print("[-] 警告: 配置中未设置 minilm_model_path，跳过加载 MiniLM。")
 
     def _detect_naming_style(self, name: str) -> str:
         """Determines the naming convention of a given identifier string."""
@@ -241,7 +213,7 @@ class HeavyWeightCandidateGenerator:
                 start_idx = min(start_idx, 511)
                 end_idx = min(max(start_idx + 1, end_idx), 512)
                 var_tokens_str = tokenizer.convert_ids_to_tokens(pv_tokens[shared_len:])
-                print(f"[Align Debug] Variable '{batch_vars[b_idx]}' aligned to tokens: {var_tokens_str}")
+                # print(f"[Align Debug] Variable '{batch_vars[b_idx]}' aligned to tokens: {var_tokens_str}")
                 # 精准抠出属于这个变量的所有 sub-token 向量，并做局部池化
                 target_hiddens = last_hidden[b_idx, start_idx:end_idx, :]
                 pooled = target_hiddens.mean(dim=0)
@@ -277,9 +249,9 @@ class HeavyWeightCandidateGenerator:
             # 3. 计算相似度
             sims = F.cosine_similarity(orig_emb, cand_embs)
 
-            print(f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Base Threshold: {base_threshold}):")
-            print(f"{'Candidate':<20} | {'Token Sim':<10} | {'Dyn Thresh':<10} | {'Status'}")
-            print("-" * 65)
+            # print(f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Base Threshold: {base_threshold}):")
+            # print(f"{'Candidate':<20} | {'Token Sim':<10} | {'Dyn Thresh':<10} | {'Status'}")
+            # print("-" * 65)
 
             target_name = ctx['target_name']
             target_parts, _ = self._split_identifier(target_name)
@@ -314,11 +286,11 @@ class HeavyWeightCandidateGenerator:
                 status = "[PASS]" if is_pass else "[FILTERED]"
 
                 # 格式化输出以供调试
-                print(f"{cand:<20} | {score:.4f}{' ':<4} | {current_threshold:.4f}{' ':<4} | {status}")
+                # print(f"{cand:<20} | {score:.4f}{' ':<4} | {current_threshold:.4f}{' ':<4} | {status}")
 
                 if is_pass:
                     semantically_valid.append(cand)
-            print("-" * 65 + "\n")
+            # print("-" * 65 + "\n")
         else:
             semantically_valid = base_cands
 
@@ -506,12 +478,12 @@ class HeavyWeightCandidateGenerator:
                 if expand_mode != 'none':
                     if expand_mode == 'prefix':
                         words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
-                        print(f"[Debug] 前缀模式生成词汇: {words[:5]}...")
+                        # print(f"[Debug] 前缀模式生成词汇: {words[:5]}...")
                         for w in words: current_cands.append(f"{w}_{target_name}")
 
                     elif expand_mode == 'suffix':
                         words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
-                        print(f"[Debug] 后缀模式生成词汇: {words[:5]}...")
+                        # print(f"[Debug] 后缀模式生成词汇: {words[:5]}...")
                         for w in words: current_cands.append(f"{target_name}_{w}")
 
                     elif expand_mode == 'both':

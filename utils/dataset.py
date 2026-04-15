@@ -12,6 +12,7 @@ class DatasetLoader:
         self.label_map = {}
         self.mode = "binary"
 
+        # 这里的 safe_flags 主要是为了兼容当 vul=1 但 cwe 却为空或标注不明时的容错处理
         self.safe_flags = [
             "", "none", "0", "safe", "nan", "null", "false",
             "<null>", "<na>"
@@ -27,8 +28,10 @@ class DatasetLoader:
         print(f"\n[*] Loading dataset in '{mode}' mode from {filepath}...")
 
         df = pd.read_parquet(filepath)
-        if 'func' not in df.columns or 'cwe' not in df.columns:
-            raise ValueError("Parquet file must contain 'func' and 'cwe' columns.")
+
+        # ✨ 修改点 1：检查列时，增加对 'vul' 列的强制要求
+        if 'func' not in df.columns or 'cwe' not in df.columns or 'vul' not in df.columns:
+            raise ValueError("Parquet file must contain 'func', 'cwe', and 'vul' columns.")
 
         def _line_count(s):
             return len([l for l in str(s).splitlines() if l.strip()])
@@ -36,7 +39,10 @@ class DatasetLoader:
         initial_count = len(df)
         df = df[df["func"].apply(_line_count) > 1].copy()
 
+        # 数据清洗，确保类型正确
         df["cwe"] = df["cwe"].fillna("").astype(str).str.strip()
+        # ✨ 修改点 2：清洗并标准化 vul 列为整数（0 或 1）
+        df["vul"] = pd.to_numeric(df["vul"], errors='coerce').fillna(0).astype(int)
 
         print(
             f"[*] Data cleaning: Filtered {initial_count - len(df)} single-line or empty codes, {len(df)} valid samples remaining.")
@@ -44,8 +50,9 @@ class DatasetLoader:
         processed_data = []
 
         if self.mode == "binary":
-            # 🌟 核心修改：安全样本设为 -1，漏洞样本设为 1（或你需要的正数）
-            df['label'] = df['cwe'].apply(lambda x: -1 if str(x).lower() in self.safe_flags else 1)
+            # ✨ 修改点 3：二分类核心修改，完全根据 vul 字段来决定 label
+            # vul == 0 -> 安全 (-1)；vul == 1 -> 漏洞 (1)
+            df['label'] = df['vul'].apply(lambda x: -1 if x == 0 else 1)
 
             safe_df = df[df['label'] == -1]
             vuln_df = df[df['label'] == 1]
@@ -68,11 +75,22 @@ class DatasetLoader:
             vuln_sampled = vuln_df.sample(n=vuln_needed, random_state=random_seed)
 
             df = pd.concat([safe_sampled, vuln_sampled]).sample(frac=1, random_state=random_seed).reset_index(drop=True)
-            # 🌟 映射表同步更新
+
             self.label_map = {-1: "Safe", 1: "Vulnerable"}
 
         elif self.mode == "multi":
-            df['label_raw'] = df['cwe'].apply(lambda x: "Safe" if str(x).lower() in self.safe_flags else x)
+            # ✨ 修改点 4：多分类核心修改。如果 vul 为 0，强制标记为 "Safe"
+            # 如果 vul 为 1，取 CWE 的值。如果此时 CWE 是空的，给一个默认的 "Unknown_CWE" 防止分类器报错
+            def determine_multi_label(row):
+                if row['vul'] == 0:
+                    return "Safe"
+                else:
+                    cwe_val = str(row['cwe']).strip()
+                    if not cwe_val or cwe_val.lower() in self.safe_flags:
+                        return "Unknown_CWE"
+                    return cwe_val
+
+            df['label_raw'] = df.apply(determine_multi_label, axis=1)
 
             if label_map_path and os.path.exists(label_map_path):
                 print(f"[*] Loading existing label map from {label_map_path}...")
@@ -86,7 +104,6 @@ class DatasetLoader:
 
                     self.label_map = {int(k): v for k, v in raw_map.items()}
 
-                # 🌟 强制将 -1 分配给 Safe，防止历史映射文件出现歧义
                 self.label_map[-1] = "Safe"
                 cwe_to_id = {v: k for k, v in self.label_map.items()}
 
@@ -100,7 +117,6 @@ class DatasetLoader:
 
             else:
                 print("[*] Generating new label mapping from current dataset...")
-                # 🌟 核心修改：将 Safe 样本隔离，只对真正的 CWE 进行编码
                 is_safe = df['label_raw'] == "Safe"
                 vuln_cwes = df.loc[~is_safe, 'label_raw']
 
@@ -110,7 +126,6 @@ class DatasetLoader:
                 else:
                     self.label_map = {}
 
-                # 🌟 手动将 Safe 强行绑定为 -1
                 self.label_map[-1] = "Safe"
                 cwe_to_id = {v: k for k, v in self.label_map.items()}
 
@@ -136,7 +151,9 @@ class DatasetLoader:
             processed_data.append({
                 "code": row["func"],
                 "label": int(row["label"]),
-                "raw_cwe": row["cwe"]
+                # ✨ 虽然被标记为了 Safe，但原始的 CWE 信息依然会保留在 raw_cwe 中供后续分析参考
+                "raw_cwe": row["cwe"],
+                "vul": row["vul"]  # 可选：把 vul 也输出保留
             })
 
         print(f"[*] Successfully processed {len(processed_data)} samples.")
