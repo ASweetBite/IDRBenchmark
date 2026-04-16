@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from utils.ast_tools import CodeTransformer
+from utils.scorer import StatisticalNamingScorer
 
 
 class HeavyWeightCandidateGenerator:
@@ -19,6 +20,8 @@ class HeavyWeightCandidateGenerator:
         self.analyzer = analyzer
         self._embedding_cache = {}
         self.config = config
+        stats_path = config.get('naming_stats_path', 'naming_stats.json')
+        self.scorer = StatisticalNamingScorer(stats_path)
 
     def _detect_naming_style(self, name: str) -> str:
         """Determines the naming convention of a given identifier string."""
@@ -208,16 +211,22 @@ class HeavyWeightCandidateGenerator:
             batch_vars = var_names[i: i + batch_size]
 
             inputs = tokenizer(
-                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=512
+                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=256
             ).to(self.mlm_engine.device)
 
             with torch.no_grad():
                 outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
                 last_hidden = outputs.hidden_states[-1]
 
+            cached_p_tokens = {}
+
             for b_idx in range(len(batch_texts)):
-                p_tokens = tokenizer.encode(batch_prefixes[b_idx], add_special_tokens=False)
-                pv_tokens = tokenizer.encode(batch_prefixes[b_idx] + batch_vars[b_idx], add_special_tokens=False)
+                p_text = batch_prefixes[b_idx]
+                if p_text not in cached_p_tokens:
+                    cached_p_tokens[p_text] = tokenizer.encode(p_text, add_special_tokens=False)
+
+                p_tokens = cached_p_tokens[p_text]
+                pv_tokens = tokenizer.encode(p_text + batch_vars[b_idx], add_special_tokens=False)
 
                 shared_len = 0
                 for pt, pvt in zip(p_tokens, pv_tokens):
@@ -228,8 +237,8 @@ class HeavyWeightCandidateGenerator:
 
                 start_idx = shared_len + 1
                 end_idx = len(pv_tokens) + 1
-                start_idx = min(start_idx, 511)
-                end_idx = min(max(start_idx + 1, end_idx), 512)
+                start_idx = min(start_idx, 255)
+                end_idx = min(max(start_idx + 1, end_idx), 256)
 
                 target_hiddens = last_hidden[b_idx, start_idx:end_idx, :]
                 pooled = target_hiddens.mean(dim=0)
@@ -251,6 +260,7 @@ class HeavyWeightCandidateGenerator:
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
         """执行语义校验与生态位配额过滤"""
         base_threshold = ctx.get('semantic_threshold', 0.85)
+        entity_type = ctx.get('entity_type', 'VARIABLE')
 
         # 预过滤：基础检查
         base_cands = []
@@ -268,9 +278,11 @@ class HeavyWeightCandidateGenerator:
                 [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
             ).to(self.mlm_engine.device)
 
-            print(f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Base Threshold: {base_threshold}):")
-            print(f"{'Candidate':<20} | {'Token Sim':<10} | {'Dyn Thresh':<10} | {'Status'}")
-            print("-" * 65)
+            # print(
+            #     f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Type: {entity_type}, Base Thresh: {base_threshold}):")
+            # print(
+            #     f"{'Candidate':<25} | {'Base Sim':<9} | {'NLP Bonus':<10} | {'Final':<8} | {'Thresh':<8} | {'Status'}")
+            # print("-" * 85)
 
         added = 0
         CHUNK_SIZE = max(50, quota * 2)
@@ -284,17 +296,34 @@ class HeavyWeightCandidateGenerator:
 
             chunk = base_cands[i: i + CHUNK_SIZE]
 
-            # ==================== 前置纯文本配额短路拦截 ====================
+            # ==================== 前置纯文本短路拦截与打分 ====================
             filtered_chunk = []
             is_trivial_flags = []
+            heuristic_bonuses = []
 
             for cand in chunk:
+                # 1. 计算 NLP 与统计学修正分
+                bonus = 0.0
+                if hasattr(self, 'scorer'):
+                    cand_parts, _ = self._split_identifier(cand)
+                    bonus = self.scorer.calculate_heuristic_score(cand_parts, entity_type)
+
+                # 2. 致命规则拦截 (如 name_name 会返回 -999，直接不进 GPU)
+                if bonus <= -100:
+                    continue
+
+                # 3. 微调配额拦截
                 is_triv = self._is_trivial_change(target_name, cand)
-                # 核心机制：如果是微调词，且配额已满，直接丢弃，不送入GPU！
                 if is_triv and trivial_added >= max_trivial_allowed:
                     continue
+
+                if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
+                    continue
+
                 filtered_chunk.append(cand)
+
                 is_trivial_flags.append(is_triv)
+                heuristic_bonuses.append(bonus)
 
             if not filtered_chunk:
                 continue
@@ -310,8 +339,13 @@ class HeavyWeightCandidateGenerator:
                     self.mlm_engine.device)
                 sims = F.cosine_similarity(orig_emb, cand_embs)
 
-                for cand, sim, is_trivial_change in zip(filtered_chunk, sims, is_trivial_flags):
-                    score = sim.item()
+                # 将基础分、微调标记和预先算好的修正分一起 zip
+                for cand, sim, is_trivial_change, bonus in zip(filtered_chunk, sims, is_trivial_flags,
+                                                               heuristic_bonuses):
+                    base_sim_score = sim.item()
+
+                    # 联合打分！
+                    final_score = base_sim_score + bonus
                     current_threshold = base_threshold
 
                     target_parts, _ = self._split_identifier(target_name)
@@ -338,9 +372,13 @@ class HeavyWeightCandidateGenerator:
                             if len(cand) <= 3:
                                 current_threshold = max(0.70, base_threshold - 0.05)
 
-                    is_pass = score >= current_threshold
+                    # 判断依据变为联合打分
+                    is_pass = final_score >= current_threshold
                     status = "[PASS]" if is_pass else "[FILTERED]"
-                    print(f"{cand:<20} | {score:.4f}{' ':<4} | {current_threshold:.4f}{' ':<4} | {status}")
+
+                    bonus_str = f"{bonus:>+.4f}" if hasattr(self, 'scorer') else "N/A"
+                    # print(
+                    #     f"{cand:<25} | {base_sim_score:.4f}  | {bonus_str:<10} | {final_score:.4f} | {current_threshold:.4f} | {status}")
 
                     if is_pass:
                         if is_trivial_change:
@@ -362,7 +400,8 @@ class HeavyWeightCandidateGenerator:
                     added += 1
 
         if base_threshold > 0:
-            print("-" * 65 + "\n")
+            pass
+            # print("-" * 85 + "\n")
 
         return added
 
@@ -424,6 +463,14 @@ class HeavyWeightCandidateGenerator:
         best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
         target_info = identifiers[target_name][best_occ_idx]
 
+        # ==================== 新增：提取并判定实体类型 ====================
+        raw_entity_type = target_info.get('entity_type', 'variable')
+        entity_type = 'FUNCTION' if raw_entity_type == 'function' else 'VARIABLE'
+        # 启发式兜底判断：如果是 is_ 开头的变量，视为布尔值
+        if entity_type == 'VARIABLE' and stripped_name.startswith(('is_', 'has_', 'can_', 'should_')):
+            entity_type = 'BOOLEAN_VAR'
+        # ================================================================
+
         prefix = code_bytes[:target_info['start']]
         suffix = code_bytes[target_info['end']:]
 
@@ -442,7 +489,6 @@ class HeavyWeightCandidateGenerator:
         dynamic_top_k = max(3, top_k_mlm // max(1, (n_parts - 1)))
         variations = []
 
-        # ==================== 单词变量的扩充机制 ====================
         if n_parts == 1 and not strict_structure:
             variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'none'})
             variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'prefix'})
@@ -523,46 +569,56 @@ class HeavyWeightCandidateGenerator:
                 current_cands = []
 
                 if expand_mode != 'none':
+                    # 【核心提速】大幅限制 expansion 模式生成的候选词数量，防止短变量发生低质组合爆炸
+                    expand_top_k = min(15, max(3, dynamic_top_k // 3))
                     if expand_mode == 'prefix':
-                        words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
+                        words = self._decode_words(logits[0, mask_indices[0], :], expand_top_k, allow_underscore=False)
                         for w in words: current_cands.append(f"{w}_{target_name}")
                     elif expand_mode == 'suffix':
-                        words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
+                        words = self._decode_words(logits[0, mask_indices[0], :], expand_top_k, allow_underscore=False)
                         for w in words: current_cands.append(f"{target_name}_{w}")
                     elif expand_mode == 'both':
-                        per_mask_top_k = max(2, dynamic_top_k // 2)
+                        per_mask_top_k = min(5, max(2, dynamic_top_k // 6))
                         words1 = self._decode_words(logits[0, mask_indices[0], :], per_mask_top_k,
                                                     allow_underscore=False)
                         words2 = self._decode_words(logits[0, mask_indices[1], :], per_mask_top_k,
                                                     allow_underscore=False)
 
-                        MAX_EXPAND_COMBOS = 50
+                        MAX_EXPAND_COMBOS = 15  # 从 50 降到 15，避免产生大量无效拼凑
                         combo_count = 0
                         for w1, w2 in itertools.product(words1, words2):
                             if combo_count >= MAX_EXPAND_COMBOS: break
                             current_cands.append(f"{w1}_{w2}")
                             combo_count += 1
                 else:
-                    # ==================== 组合逻辑优化 (防爆炸版) ====================
                     if var['num_masks'] == 1:
                         per_mask_top_k = min(20, dynamic_top_k)
                     elif var['num_masks'] == 2:
                         per_mask_top_k = min(8, max(3, dynamic_top_k // 2))
                     elif var['num_masks'] >= n_parts - 1 and var['num_masks'] >= 3:
-                        # 针对 max 和 max-1 个洞的“大跨度重构”，极度收紧单洞候选词
-                        # 例如 4 个洞，每个洞只给 3 个最顶级的词，防止指数爆炸
+                        # 对于大跨度重构，每个洞只给极少量的顶级候选词
                         per_mask_top_k = 3
                     else:
                         per_mask_top_k = min(4, max(2, dynamic_top_k // 3))
 
-                    expanded_top_k = dynamic_top_k * 3 if strict_structure else per_mask_top_k
-                    mask_preds = []
+                    # 2. 【核心提速】限制解码深度：不再解码几百个词，而是只解码略多于 per_mask_top_k 的数量
+                    # 这样可以减少 _decode_words 内部字符串处理和正则过滤的开销
+                    decode_budget = per_mask_top_k * 2 if not strict_structure else per_mask_top_k * 3
 
+                    mask_preds = []
                     for m_idx in range(var['num_masks']):
                         part_idx = var['start'] + m_idx if strict_structure else None
                         req_len = target_lengths[part_idx] if strict_structure else None
-                        words = self._decode_words(logits[0, mask_indices[m_idx], :], expanded_top_k,
-                                                   allow_underscore=False, required_length=req_len)
+
+                        # 使用受限的 decode_budget 进行解码
+                        words = self._decode_words(
+                            logits[0, mask_indices[m_idx], :],
+                            decode_budget, # <--- 关键修改：直接限制 MLM 解码深度
+                            allow_underscore=False,
+                            required_length=req_len
+                        )
+
+                        # 截取最终需要的数量
                         words = words[:per_mask_top_k]
 
                         if strict_structure and not words:
@@ -571,18 +627,18 @@ class HeavyWeightCandidateGenerator:
                             words = ['temp']
                         mask_preds.append(words)
 
-                    # ==================== 硬性组合上限拦截 ====================
+                    # ==================== 组合上限拦截 (CPU 保护) ====================
                     if var['num_masks'] >= n_parts - 1 and var['num_masks'] >= 3:
-                        # 即使单洞给 3 个词，3^4 也有 81 种组合，强制只取前 24 个最具代表性的
-                        MAX_COMBINATIONS = 24
+                        MAX_COMBINATIONS = 20  # 稍微调低大跨度重构组合
                     else:
-                        MAX_COMBINATIONS = 120 if var['num_masks'] > 1 else 30
+                        MAX_COMBINATIONS = 100 if var['num_masks'] > 1 else 30
 
                     combo_count = 0
                     for combo in itertools.product(*mask_preds):
                         if combo_count >= MAX_COMBINATIONS: break
                         combo_count += 1
                         cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style, target_name)
+                        # ... 剩下的逻辑保持不变 ...
                         if strict_structure:
                             if [len(p) for p in self._split_identifier(cand)[0]] == target_lengths:
                                 current_cands.append(cand)
@@ -610,7 +666,8 @@ class HeavyWeightCandidateGenerator:
             'keywords': self.analyzer.keywords, 'original_style': original_style,
             'local_prefix': local_prefix,
             'local_suffix': local_suffix,
-            'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style
+            'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style,
+            'entity_type': entity_type
         }
 
         final_candidates = []

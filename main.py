@@ -1,6 +1,6 @@
 import argparse
+import os
 import random
-import time
 
 import numpy as np
 import torch
@@ -13,13 +13,36 @@ from attacks.NormalizationAttacker import NormalizationAttacker
 from attacks.RandomAttacker import RandomAttacker
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset import DatasetLoader
+from utils.miner import NamingDataMiner
 from utils.mlm_engine import MLMEngine
 from utils.model_zoo import ModelZoo, CodeSmoother
 
 
 def main(args, config):
     """Orchestrates the evaluation of model robustness against various renaming attacks."""
+
     analyzer = IdentifierAnalyzer(lang=config['analyzer']['lang'])
+    if 'heavyweight_candidate' not in config:
+        config['heavyweight_candidate'] = {}
+    stats_path = config['heavyweight_candidate'].get('naming_stats_path', 'naming_stats.json')
+    dataset_path = config['run_params']['dataset']
+
+    if not os.path.exists(stats_path):
+        print(f"\n[!] 启发式命名统计字典 '{stats_path}' 不存在。")
+        print(f"[*] 正在启动离线数据挖掘程序 (基于数据集: {dataset_path})...")
+
+        miner = NamingDataMiner(analyzer)
+        miner.mine_parquet(dataset_path)
+        miner.export_json(stats_path)
+    else:
+        print(f"\n[*] 发现已存在的命名统计字典: {stats_path}，跳过挖掘阶段。")
+
+    # 显式注入路径，确保 Generator 能够读取到
+    config['heavyweight_candidate']['naming_stats_path'] = stats_path
+    # =========================================================================
+
+    # 2. 字典准备就绪，正常加载极其耗时的深度学习引擎
+    print("\n[*] Loading MLM Engine and Model Zoo...")
     mlm_engine = MLMEngine(config['mlm_engine']['model_name'])
 
     light_cand_config = {
@@ -27,12 +50,14 @@ def main(args, config):
     }
     lightweight_generator = LightweightCandidateGenerator(light_cand_config)
 
+    # 此时 HeavyWeightCandidateGenerator 内部的 scorer 可以安全地读取刚刚生成的 JSON 了
     generator = HeavyWeightCandidateGenerator(
         mlm_engine,
         analyzer,
         config=config['heavyweight_candidate']
     )
 
+    # ... 下方保留你原有的逻辑不变 ...
     smoother_cfg = config['smoother']
     smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
 
