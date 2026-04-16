@@ -60,14 +60,14 @@ class DatasetLoader:
             print(f"[*] Original data distribution: Safe={len(safe_df)}, Vuln={len(vuln_df)}")
 
             if max_samples and max_samples < len(df):
-                safe_needed = max_samples // 3
+                safe_needed = max_samples // 2
                 vuln_needed = max_samples - safe_needed
             else:
                 safe_needed = len(safe_df)
-                vuln_needed = safe_needed * 2
+                vuln_needed = safe_needed
 
             safe_needed = min(safe_needed, len(safe_df))
-            vuln_needed = min(vuln_needed, len(vuln_df), safe_needed * 2)
+            vuln_needed = min(vuln_needed, len(vuln_df), safe_needed)
 
             print(f"[*] Balanced sampling (1:2): Safe={safe_needed}, Vuln={vuln_needed} (Seed={random_seed})")
 

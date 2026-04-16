@@ -1,11 +1,9 @@
 import itertools
-import os
 import random
 import re
 from collections import defaultdict
-from typing import List, Any
+from typing import List
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -104,18 +102,13 @@ class HeavyWeightCandidateGenerator:
             ).to(self.mlm_engine.device)
 
             with torch.no_grad():
-                # Request hidden states to extract the sequence representations
                 outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
-                # Usually, hidden_states[-1] is the last layer's hidden states: [batch, seq_len, hidden_dim]
                 last_hidden = outputs.hidden_states[-1]
-
-                # Mean Pooling: Ignore padding tokens
                 attention_mask = inputs['attention_mask'].unsqueeze(-1).expand(last_hidden.size()).float()
                 sum_embeddings = torch.sum(last_hidden * attention_mask, dim=1)
                 sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
                 mean_pooled = sum_embeddings / sum_mask
-
-                all_embeddings.append(mean_pooled.cpu().detach())  # Offload to CPU to save VRAM
+                all_embeddings.append(mean_pooled.cpu().detach())
 
         return torch.cat(all_embeddings, dim=0)
 
@@ -140,6 +133,38 @@ class HeavyWeightCandidateGenerator:
 
         return batch_logits, batch_mask_indices
 
+    def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict]) -> int:
+        """在变量的所有出现位置中，评估并选择一个语义信息最丰富的上下文位置。"""
+        if len(occurrences) <= 1: return 0
+
+        best_idx = 0
+        max_score = -1.0
+        search_limit = min(len(occurrences), 10)
+
+        for i in range(search_limit):
+            occ = occurrences[i]
+            local_prefix, local_suffix = self._extract_local_context_ast(
+                code_bytes, occ['start'], occ['end']
+            )
+
+            score = 0.0
+            score += len(local_prefix) + len(local_suffix)
+
+            if '(' in local_suffix or ',' in local_suffix:
+                score += 100
+
+            if any(k in local_prefix for k in ['if ', 'while ', 'for ', 'return ']):
+                score += 80
+
+            if re.search(r'=\s*(0|NULL|nullptr|false|true|\{\})\s*;', local_suffix):
+                score -= 150
+
+            if score > max_score:
+                max_score = score
+                best_idx = i
+
+        return best_idx
+
     def _decode_words(self, mask_logits, top_k, allow_underscore=False, required_length=None):
         """Decodes model logits into a list of candidate words filtered by style and length constraints."""
         _, top_indices = torch.topk(mask_logits, top_k, dim=-1)
@@ -162,6 +187,7 @@ class HeavyWeightCandidateGenerator:
         """Validates if a specific candidate renaming is syntactically correct and doesn't conflict in the AST."""
         if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
             return None
+        # 假设 CodeTransformer 已经在外部导入或可用
         try:
             CodeTransformer.validate_and_apply(ctx['code_bytes'], ctx['identifiers'],
                                                {ctx['target_name']: cand}, analyzer=self.analyzer)
@@ -171,13 +197,9 @@ class HeavyWeightCandidateGenerator:
 
     def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
                                        batch_size: int = 32) -> torch.Tensor:
-        """
-        核心科技：计算带有上下文的 Token 级变量语义向量，抛弃整句噪音。
-        精准定位 BPE 分词后的变量边界，彻底解决分数拥挤和缩写识别问题。
-        """
+        """精准定位 BPE 分词后的变量边界，提取Token级变量语义向量"""
         all_embeddings = []
         tokenizer = self.mlm_engine.tokenizer
-
         full_texts = [p + v + s for p, v, s in zip(prefixes, var_names, suffixes)]
 
         for i in range(0, len(full_texts), batch_size):
@@ -191,10 +213,9 @@ class HeavyWeightCandidateGenerator:
 
             with torch.no_grad():
                 outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
-                last_hidden = outputs.hidden_states[-1]  # [batch, seq_len, hidden_dim]
+                last_hidden = outputs.hidden_states[-1]
 
             for b_idx in range(len(batch_texts)):
-                # 利用 BPE 序列匹配法，精准找到变量在句子中的 Token 索引
                 p_tokens = tokenizer.encode(batch_prefixes[b_idx], add_special_tokens=False)
                 pv_tokens = tokenizer.encode(batch_prefixes[b_idx] + batch_vars[b_idx], add_special_tokens=False)
 
@@ -205,25 +226,30 @@ class HeavyWeightCandidateGenerator:
                     else:
                         break
 
-                # 定位变量 Token 的起止位置 (考虑 [CLS] 占据的 index 0)
                 start_idx = shared_len + 1
                 end_idx = len(pv_tokens) + 1
-
-                # 边界安全拦截
                 start_idx = min(start_idx, 511)
                 end_idx = min(max(start_idx + 1, end_idx), 512)
-                var_tokens_str = tokenizer.convert_ids_to_tokens(pv_tokens[shared_len:])
-                # print(f"[Align Debug] Variable '{batch_vars[b_idx]}' aligned to tokens: {var_tokens_str}")
-                # 精准抠出属于这个变量的所有 sub-token 向量，并做局部池化
+
                 target_hiddens = last_hidden[b_idx, start_idx:end_idx, :]
                 pooled = target_hiddens.mean(dim=0)
-
                 all_embeddings.append(pooled.cpu().detach())
 
         return torch.stack(all_embeddings)
 
+    def _is_trivial_change(self, target_name: str, cand: str) -> bool:
+        """【新增】纯文本判断是否为微小改动（前置短路拦截使用）"""
+        target_parts, _ = self._split_identifier(target_name)
+        cand_parts, _ = self._split_identifier(cand)
+
+        if len(target_parts) > 2 and len(cand_parts) > 0:
+            identical_count = sum(1 for p1, p2 in zip(target_parts, cand_parts) if p1.lower() == p2.lower())
+            change_ratio = 1.0 - (identical_count / max(len(target_parts), len(cand_parts)))
+            return change_ratio <= 0.33
+        return False
+
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
-        # 获取基础语义阈值（假设配置中设为 0.85）
+        """执行语义校验与生态位配额过滤"""
         base_threshold = ctx.get('semantic_threshold', 0.85)
 
         # 预过滤：基础检查
@@ -233,111 +259,133 @@ class HeavyWeightCandidateGenerator:
             if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
             base_cands.append(cand)
 
-        # 核心环节：Token-Level 语义过滤
-        semantically_valid = []
-        if base_cands and base_threshold > 0:
-            # 1. 提取原变量 Token 向量
+        if not base_cands:
+            return 0
+
+        orig_emb = None
+        if base_threshold > 0:
             orig_emb = self._get_variable_token_embeddings(
                 [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
             ).to(self.mlm_engine.device)
 
-            # 2. 批量提取候选词 Token 向量
-            prefixes = [ctx['local_prefix']] * len(base_cands)
-            suffixes = [ctx['local_suffix']] * len(base_cands)
-            cand_embs = self._get_variable_token_embeddings(prefixes, base_cands, suffixes).to(self.mlm_engine.device)
+            print(f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Base Threshold: {base_threshold}):")
+            print(f"{'Candidate':<20} | {'Token Sim':<10} | {'Dyn Thresh':<10} | {'Status'}")
+            print("-" * 65)
 
-            # 3. 计算相似度
-            sims = F.cosine_similarity(orig_emb, cand_embs)
-
-            # print(f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Base Threshold: {base_threshold}):")
-            # print(f"{'Candidate':<20} | {'Token Sim':<10} | {'Dyn Thresh':<10} | {'Status'}")
-            # print("-" * 65)
-
-            target_name = ctx['target_name']
-            target_parts, _ = self._split_identifier(target_name)
-
-            for cand, sim in zip(base_cands, sims):
-                score = sim.item()
-
-                # ==================== 新增：动态阈值调整引擎 ====================
-                current_threshold = base_threshold
-                cand_parts, _ = self._split_identifier(cand)
-
-                # 仅针对目标变量是单字的情况进行动态适应
-                if len(target_parts) == 1:
-                    if len(cand_parts) > 1:
-                        # 发生了扩充 (生成了两个及以上的词汇)
-                        if target_name.lower() in [p.lower() for p in cand_parts]:
-                            # 模式 1: 保留了原词的扩充 (如 vma_cache) -> 天生分高，严格卡死 (+0.10)
-                            current_threshold = min(0.98, base_threshold + 0.10)
-                        else:
-                            # 模式 2: 未保留原词的扩充 (如 mem_area) -> 分数稍高，适当收紧 (+0.05)
-                            current_threshold = min(0.95, base_threshold + 0.05)
-                    else:
-                        # 模式 3: 非扩充，依然是单字替换 (如 area)
-                        # 如果单词特别短（长度 <= 3），为了防止被误杀，甚至可以考虑微调降低阈值
-                        if len(cand) <= 3:
-                            current_threshold = max(0.50, base_threshold - 0.15)
-                        else:
-                            current_threshold = base_threshold
-                # ================================================================
-
-                is_pass = score >= current_threshold
-                status = "[PASS]" if is_pass else "[FILTERED]"
-
-                # 格式化输出以供调试
-                # print(f"{cand:<20} | {score:.4f}{' ':<4} | {current_threshold:.4f}{' ':<4} | {status}")
-
-                if is_pass:
-                    semantically_valid.append(cand)
-            # print("-" * 65 + "\n")
-        else:
-            semantically_valid = base_cands
-
-        # 最终的 AST 验证逻辑
         added = 0
-        for cand in semantically_valid:
+        CHUNK_SIZE = max(50, quota * 2)
+        trivial_added = 0
+        max_trivial_allowed = max(1, int(quota * 0.4))
+        target_name = ctx['target_name']
+
+        for i in range(0, len(base_cands), CHUNK_SIZE):
             if added >= quota:
                 break
-            valid_cand = self._verify_ast_single(cand, ctx)
-            if valid_cand and valid_cand not in final_candidates:
-                final_candidates.append(valid_cand)
-                added += 1
+
+            chunk = base_cands[i: i + CHUNK_SIZE]
+
+            # ==================== 前置纯文本配额短路拦截 ====================
+            filtered_chunk = []
+            is_trivial_flags = []
+
+            for cand in chunk:
+                is_triv = self._is_trivial_change(target_name, cand)
+                # 核心机制：如果是微调词，且配额已满，直接丢弃，不送入GPU！
+                if is_triv and trivial_added >= max_trivial_allowed:
+                    continue
+                filtered_chunk.append(cand)
+                is_trivial_flags.append(is_triv)
+
+            if not filtered_chunk:
+                continue
+            # ================================================================
+
+            semantically_valid = []
+
+            if base_threshold > 0:
+                prefixes = [ctx['local_prefix']] * len(filtered_chunk)
+                suffixes = [ctx['local_suffix']] * len(filtered_chunk)
+
+                cand_embs = self._get_variable_token_embeddings(prefixes, filtered_chunk, suffixes).to(
+                    self.mlm_engine.device)
+                sims = F.cosine_similarity(orig_emb, cand_embs)
+
+                for cand, sim, is_trivial_change in zip(filtered_chunk, sims, is_trivial_flags):
+                    score = sim.item()
+                    current_threshold = base_threshold
+
+                    target_parts, _ = self._split_identifier(target_name)
+                    cand_parts, _ = self._split_identifier(cand)
+
+                    # 动态阈值调整引擎
+                    if len(target_parts) > 2 and len(cand_parts) > 0:
+                        if is_trivial_change:
+                            current_threshold = min(0.96, base_threshold + 0.08)
+                        else:
+                            # 重新计算 change_ratio 判定大改
+                            identical_count = sum(
+                                1 for p1, p2 in zip(target_parts, cand_parts) if p1.lower() == p2.lower())
+                            change_ratio = 1.0 - (identical_count / max(len(target_parts), len(cand_parts)))
+                            if change_ratio >= 0.6:
+                                current_threshold = max(0.60, base_threshold - 0.15)
+                    elif len(target_parts) == 1:
+                        if len(cand_parts) > 1:
+                            if target_name.lower() in [p.lower() for p in cand_parts]:
+                                current_threshold = min(0.98, base_threshold + 0.10)
+                            else:
+                                current_threshold = min(0.95, base_threshold + 0.05)
+                        else:
+                            if len(cand) <= 3:
+                                current_threshold = max(0.70, base_threshold - 0.05)
+
+                    is_pass = score >= current_threshold
+                    status = "[PASS]" if is_pass else "[FILTERED]"
+                    print(f"{cand:<20} | {score:.4f}{' ':<4} | {current_threshold:.4f}{' ':<4} | {status}")
+
+                    if is_pass:
+                        if is_trivial_change:
+                            if trivial_added < max_trivial_allowed:
+                                semantically_valid.append(cand)
+                                trivial_added += 1
+                        else:
+                            semantically_valid.append(cand)
+            else:
+                semantically_valid = filtered_chunk
+
+            # 最终的 AST 验证逻辑
+            for cand in semantically_valid:
+                if added >= quota:
+                    break
+                valid_cand = self._verify_ast_single(cand, ctx)
+                if valid_cand and valid_cand not in final_candidates:
+                    final_candidates.append(valid_cand)
+                    added += 1
+
+        if base_threshold > 0:
+            print("-" * 65 + "\n")
 
         return added
 
     def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int) -> tuple[str, str]:
-        """
-        利用 Tree-sitter AST 精准提取变量所在的最小逻辑语句（Statement）。
-        向上回溯节点，直到其父节点是一个块作用域或全局作用域。
-        """
-        # 使用 analyzer 中已配置好的 language 创建临时 parser
+        """利用 Tree-sitter AST 精准提取变量所在的最小逻辑语句。"""
         from tree_sitter import Parser
         parser = Parser()
         parser.language = self.analyzer.language
         tree = parser.parse(code_bytes)
 
-        # 1. 找到精准匹配目标字节范围的 AST 节点
         node = tree.root_node.descendant_for_byte_range(target_start, target_end)
 
         if not node:
-            # 极端异常情况下的降级：退回物理行
             line_start = code_bytes.rfind(b'\n', 0, target_start) + 1
             line_end = code_bytes.find(b'\n', target_end)
             if line_end == -1: line_end = len(code_bytes)
             return (code_bytes[line_start:target_start].decode("utf-8", errors="replace"),
                     code_bytes[target_end:line_end].decode("utf-8", errors="replace"))
 
-        # 2. 向上回溯，寻找包含该变量的完整语句层级
         statement_node = node
-        # 遇到这些父节点类型时停止回溯，意味着当前 node 已经是一个完整的 Statement/Declaration
         stop_parent_types = {
-            'compound_statement',  # { ... } 内部的语句
-            'translation_unit',  # 全局文件的顶层语句
-            'function_definition',  # 防止把整个函数体都切进去
-            'for_statement',  # 防止提取出整个 for 循环块，只保留初始化或条件部分
-            'while_statement',
-            'if_statement'
+            'compound_statement', 'translation_unit', 'function_definition',
+            'for_statement', 'while_statement', 'if_statement'
         }
 
         while statement_node.parent:
@@ -348,7 +396,6 @@ class HeavyWeightCandidateGenerator:
         stmt_start = statement_node.start_byte
         stmt_end = statement_node.end_byte
 
-        # 3. 截取该 Statement 内部，变量前和变量后的字符串作为 prefix 和 suffix
         local_prefix = code_bytes[stmt_start:target_start].decode("utf-8", errors="replace")
         local_suffix = code_bytes[target_end:stmt_end].decode("utf-8", errors="replace")
 
@@ -370,28 +417,19 @@ class HeavyWeightCandidateGenerator:
         if len(stripped_name) == 1:
             min_freq = self.config.get('min_freq_for_single_char', 3)
             occurrence_count = len(identifiers[target_name])
-
             if occurrence_count < min_freq:
                 return []
 
         original_style = self._detect_naming_style(target_name)
+        best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
+        target_info = identifiers[target_name][best_occ_idx]
 
-        # 获取目标变量在字节码中的位置信息
-        target_info = identifiers[target_name][0]
         prefix = code_bytes[:target_info['start']]
         suffix = code_bytes[target_info['end']:]
 
-        # 获取用于计算相似度的精确语句级上下文
         local_prefix, local_suffix = self._extract_local_context_ast(
             code_bytes, target_info['start'], target_info['end']
         )
-
-        original_code_emb = None
-        if semantic_threshold > 0:
-            original_local_str = local_prefix + target_name + local_suffix
-            original_code_emb = self._get_code_embedding_batched([original_local_str])
-            if original_code_emb is not None:
-                original_code_emb = original_code_emb.to(self.mlm_engine.device)
 
         parts, style = self._split_identifier(target_name)
         n_parts = len(parts)
@@ -402,7 +440,6 @@ class HeavyWeightCandidateGenerator:
         mask_token = self.mlm_engine.tokenizer.mask_token
 
         dynamic_top_k = max(3, top_k_mlm // max(1, (n_parts - 1)))
-
         variations = []
 
         # ==================== 单词变量的扩充机制 ====================
@@ -412,29 +449,42 @@ class HeavyWeightCandidateGenerator:
             variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'suffix'})
             variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 2, 'expand_mode': 'both'})
 
-        # ==================== 复合词变体生成 ====================
+        # ==================== 复合词变体生成 (受控滑动窗口版) ====================
         elif strict_structure:
+            # 完整替换 (max 洞)
             variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts, 'expand_mode': 'none'})
             if n_parts > 1:
-                max_sub_length = n_parts if n_parts <= 3 else 2
                 for s in range(n_parts):
-                    for e in range(s + 1, min(s + 1 + max_sub_length, n_parts + 1)):
+                    for e in range(s + 1, n_parts + 1):
                         if s == 0 and e == n_parts: continue
+
+                        mask_len = e - s
+                        # 核心改动：保留 1个词、2个词 和 max-1 个词的滑动窗口，跳过中间长度
+                        if mask_len > 2 and mask_len != (n_parts - 1):
+                            continue
+
                         variations.append(
-                            {'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s, 'expand_mode': 'none'})
+                            {'type': 'sub', 'start': s, 'end': e, 'num_masks': mask_len, 'expand_mode': 'none'})
         else:
+            # 非严格模式的完整替换
             variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1, 'expand_mode': 'none'})
             if n_parts > 1:
                 variations.append(
                     {'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts, 'expand_mode': 'none'})
-                max_sub_length = n_parts if n_parts <= 3 else 2
+
                 for s in range(n_parts):
-                    for e in range(s + 1, min(s + 1 + max_sub_length, n_parts + 1)):
+                    for e in range(s + 1, n_parts + 1):
                         if s == 0 and e == n_parts: continue
+
+                        mask_len = e - s
+                        # 核心改动：保留 1个词、2个词 和 max-1 个词的滑动窗口
+                        if mask_len > 2 and mask_len != (n_parts - 1):
+                            continue
+
                         variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': 1, 'expand_mode': 'none'})
-                        if (e - s) > 1:
+                        if mask_len > 1:
                             variations.append(
-                                {'type': 'sub', 'start': s, 'end': e, 'num_masks': e - s, 'expand_mode': 'none'})
+                                {'type': 'sub', 'start': s, 'end': e, 'num_masks': mask_len, 'expand_mode': 'none'})
 
         cropped_codes = []
         context_half = 700
@@ -445,8 +495,6 @@ class HeavyWeightCandidateGenerator:
 
         for var in variations:
             expand_mode = var.get('expand_mode', 'none')
-
-            # 根据模式构造带下划线的特殊 Mask
             if expand_mode == 'none':
                 masked_var = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style,
                                                        mask_token, target_name)
@@ -474,18 +522,13 @@ class HeavyWeightCandidateGenerator:
 
                 current_cands = []
 
-                # ==================== 处理扩充模式的候选词组装 ====================
                 if expand_mode != 'none':
                     if expand_mode == 'prefix':
                         words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
-                        # print(f"[Debug] 前缀模式生成词汇: {words[:5]}...")
                         for w in words: current_cands.append(f"{w}_{target_name}")
-
                     elif expand_mode == 'suffix':
                         words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=False)
-                        # print(f"[Debug] 后缀模式生成词汇: {words[:5]}...")
                         for w in words: current_cands.append(f"{target_name}_{w}")
-
                     elif expand_mode == 'both':
                         per_mask_top_k = max(2, dynamic_top_k // 2)
                         words1 = self._decode_words(logits[0, mask_indices[0], :], per_mask_top_k,
@@ -499,15 +542,19 @@ class HeavyWeightCandidateGenerator:
                             if combo_count >= MAX_EXPAND_COMBOS: break
                             current_cands.append(f"{w1}_{w2}")
                             combo_count += 1
-
-                # ==================== 原有的非扩充模式组装 ====================
-                elif var['num_masks'] == 1 and not strict_structure:
-                    words = self._decode_words(logits[0, mask_indices[0], :], dynamic_top_k, allow_underscore=True)
-                    for w in words:
-                        current_cands.append(
-                            self._assemble_multi_candidate(parts, var['start'], var['end'], (w,), style, target_name))
                 else:
-                    per_mask_top_k = min(10, max(2, dynamic_top_k // var['num_masks']))
+                    # ==================== 组合逻辑优化 (防爆炸版) ====================
+                    if var['num_masks'] == 1:
+                        per_mask_top_k = min(20, dynamic_top_k)
+                    elif var['num_masks'] == 2:
+                        per_mask_top_k = min(8, max(3, dynamic_top_k // 2))
+                    elif var['num_masks'] >= n_parts - 1 and var['num_masks'] >= 3:
+                        # 针对 max 和 max-1 个洞的“大跨度重构”，极度收紧单洞候选词
+                        # 例如 4 个洞，每个洞只给 3 个最顶级的词，防止指数爆炸
+                        per_mask_top_k = 3
+                    else:
+                        per_mask_top_k = min(4, max(2, dynamic_top_k // 3))
+
                     expanded_top_k = dynamic_top_k * 3 if strict_structure else per_mask_top_k
                     mask_preds = []
 
@@ -524,13 +571,18 @@ class HeavyWeightCandidateGenerator:
                             words = ['temp']
                         mask_preds.append(words)
 
-                    MAX_COMBINATIONS = 150
+                    # ==================== 硬性组合上限拦截 ====================
+                    if var['num_masks'] >= n_parts - 1 and var['num_masks'] >= 3:
+                        # 即使单洞给 3 个词，3^4 也有 81 种组合，强制只取前 24 个最具代表性的
+                        MAX_COMBINATIONS = 24
+                    else:
+                        MAX_COMBINATIONS = 120 if var['num_masks'] > 1 else 30
+
                     combo_count = 0
                     for combo in itertools.product(*mask_preds):
                         if combo_count >= MAX_COMBINATIONS: break
                         combo_count += 1
-                        cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style,
-                                                              target_name)
+                        cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style, target_name)
                         if strict_structure:
                             if [len(p) for p in self._split_identifier(cand)[0]] == target_lengths:
                                 current_cands.append(cand)
@@ -556,18 +608,24 @@ class HeavyWeightCandidateGenerator:
         ctx = {
             'code_bytes': code_bytes, 'target_name': target_name, 'identifiers': identifiers,
             'keywords': self.analyzer.keywords, 'original_style': original_style,
-            'original_code_emb': original_code_emb,
             'local_prefix': local_prefix,
             'local_suffix': local_suffix,
             'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style
         }
 
         final_candidates = []
-        target_full_quota = int(top_n_keep * context_ratio)
+
+        # ==================== 修复单字变量 15 个限制的 Bug ====================
+        if not unique_sub:
+            target_full_quota = top_n_keep
+        else:
+            target_full_quota = int(top_n_keep * context_ratio)
 
         actual_full = self._verify_and_filter(unique_full, target_full_quota, final_candidates, ctx,
                                               is_full_context=True)
-        self._verify_and_filter(unique_sub, top_n_keep - actual_full, final_candidates, ctx, is_full_context=False)
+
+        if unique_sub:
+            self._verify_and_filter(unique_sub, top_n_keep - actual_full, final_candidates, ctx, is_full_context=False)
 
         if strict_structure and len(final_candidates) < top_n_keep:
             if hasattr(self, '_generate_structural_fallback'):
