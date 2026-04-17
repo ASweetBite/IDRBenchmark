@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import random
 
@@ -13,6 +14,7 @@ from attacks.NormalizationAttacker import NormalizationAttacker
 from attacks.RandomAttacker import RandomAttacker
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset import DatasetLoader
+from utils.llm_loder import LocalLLMClient
 from utils.miner import NamingDataMiner
 from utils.mlm_engine import MLMEngine
 from utils.model_zoo import ModelZoo, CodeSmoother
@@ -45,19 +47,23 @@ def main(args, config):
     print("\n[*] Loading MLM Engine and Model Zoo...")
     mlm_engine = MLMEngine(config['mlm_engine']['model_name'])
 
+    # ==================== [新增] 初始化 LLM 客户端 ====================
+    llm_name = config.get('llm_generator_name', 'models/qwen2.5-1.5b-code')
+    llm_client = LocalLLMClient(model_name=llm_name)
+    # ================================================================
+
     light_cand_config = {
         "candidate": config['lightweight_candidate']
     }
     lightweight_generator = LightweightCandidateGenerator(light_cand_config)
 
-    # 此时 HeavyWeightCandidateGenerator 内部的 scorer 可以安全地读取刚刚生成的 JSON 了
     generator = HeavyWeightCandidateGenerator(
-        mlm_engine,
-        analyzer,
+        mlm_engine=mlm_engine,
+        llm_client=llm_client,  # <--- 注入轻量级 LLM
+        analyzer=analyzer,
         config=config['heavyweight_candidate']
     )
 
-    # ... 下方保留你原有的逻辑不变 ...
     smoother_cfg = config['smoother']
     smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
 
@@ -105,16 +111,13 @@ def main(args, config):
                 if var == outermost_func_name:
                     # 是最外部函数：使用完整代码，并可以安全复用之前的 identifiers
                     target_code_str = code_str
-                    target_identifiers = identifiers
                 else:
                     # 局部变量/内部结构：调用折叠方法获取切片代码
                     target_code_str = analyzer.get_folded_code(code_bytes, var)
-                    # 【关键】因为代码已经被切片改变，旧的 AST 位置已失效，必须设为 None 让生成器重新解析
-                    target_identifiers = None
 
-                    # 调用候选词生成逻辑
+                # 调用双引擎候选词生成逻辑
                 pool[var] = generator.generate_candidates(
-                    target_code_str, var, identifiers=target_identifiers
+                    target_code_str, var
                 )
 
                 # 记录结束时间并计算差值
@@ -128,6 +131,10 @@ def main(args, config):
             except Exception as e:
                 print(f"[Warning] Failed to generate for {var}: {e}")
                 pool[var] = []
+
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
 
         return pool
 

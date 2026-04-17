@@ -9,14 +9,16 @@ run_params:
   samples: 100
   dataset: "./data/bigvul_polars.parquet"
   iterations: 20
-  algorithm: "greedy"
+  algorithm: "bo"
   run_mode: "attack"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   use_majority_voting: false
 
 # Target Models
 model_zoo:
-    CodeBERT: "./models/finetuned_model_codebert_1"
+  CodeBERT: "./models/binary_diversevul_codebert"
+
+llm_generator_name: "models/qwen2.5-1.5b-code"
 
 # Candidate Generation Configurations
 lightweight_candidate:
@@ -27,11 +29,11 @@ lightweight_candidate:
 
 heavyweight_candidate:
   top_k_mlm: 60
-  top_n_keep: 100
+  top_n_keep: 50
   semantic_threshold: 0.85
   structural_semantic_threshold: 0.5
   minilm_model_path: "models/binary_diversevul_codebert_pure_dataset"
-  context_ratio: 0.2
+  context_ratio: 0.1
   preserve_style: true
 
 # Attacker and Optimizer Configurations

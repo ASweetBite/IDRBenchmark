@@ -1,4 +1,4 @@
-import itertools
+import json
 import random
 import re
 from collections import defaultdict
@@ -8,19 +8,23 @@ import torch
 import torch.nn.functional as F
 
 from utils.ast_tools import CodeTransformer
-from utils.scorer import StatisticalNamingScorer
 
 
 class HeavyWeightCandidateGenerator:
-    """Generates context-aware identifier candidates using Masked Language Modeling and AST validation."""
-
-    def __init__(self, mlm_engine, analyzer, config):
-        """Initializes the generator with a language model engine, AST analyzer, and configuration."""
+    def __init__(self, mlm_engine, llm_client, analyzer, config):
+        """
+        初始化生成器。
+        :param mlm_engine: 用于提取 Token Embedding 和计算相似度的模型 (如 CodeBERT)
+        :param llm_client: 用于生成候选词的轻量级本地大模型客户端
+        """
         self.mlm_engine = mlm_engine
+        self.llm_client = llm_client
         self.analyzer = analyzer
-        self._embedding_cache = {}
         self.config = config
         stats_path = config.get('naming_stats_path', 'naming_stats.json')
+
+        # 假设你已经导入了 StatisticalNamingScorer
+        from utils.scorer import StatisticalNamingScorer
         self.scorer = StatisticalNamingScorer(stats_path)
 
     def _detect_naming_style(self, name: str) -> str:
@@ -257,8 +261,9 @@ class HeavyWeightCandidateGenerator:
             return change_ratio <= 0.33
         return False
 
-    def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False):
-        """执行语义校验与生态位配额过滤"""
+    def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx, is_full_context=False,
+                           generator_source="UNKNOWN"):
+        """执行语义校验与生态位配额过滤 (支持区分 LLM 与 MLM 动态阈值)"""
         base_threshold = ctx.get('semantic_threshold', 0.85)
         entity_type = ctx.get('entity_type', 'VARIABLE')
 
@@ -279,7 +284,7 @@ class HeavyWeightCandidateGenerator:
             ).to(self.mlm_engine.device)
 
             # print(
-            #     f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Type: {entity_type}, Base Thresh: {base_threshold}):")
+            #     f"\n[*] 语义验证阶段 (Target: '{ctx['target_name']}', Type: {entity_type}, Source: {generator_source}, Base: {base_threshold}):")
             # print(
             #     f"{'Candidate':<25} | {'Base Sim':<9} | {'NLP Bonus':<10} | {'Final':<8} | {'Thresh':<8} | {'Status'}")
             # print("-" * 85)
@@ -289,6 +294,9 @@ class HeavyWeightCandidateGenerator:
         trivial_added = 0
         max_trivial_allowed = max(1, int(quota * 0.4))
         target_name = ctx['target_name']
+        target_parts, _ = self._split_identifier(target_name)
+
+        return_type = ctx.get('return_type', None)
 
         for i in range(0, len(base_cands), CHUNK_SIZE):
             if added >= quota:
@@ -296,23 +304,24 @@ class HeavyWeightCandidateGenerator:
 
             chunk = base_cands[i: i + CHUNK_SIZE]
 
-            # ==================== 前置纯文本短路拦截与打分 ====================
             filtered_chunk = []
             is_trivial_flags = []
             heuristic_bonuses = []
 
             for cand in chunk:
-                # 1. 计算 NLP 与统计学修正分
                 bonus = 0.0
                 if hasattr(self, 'scorer'):
                     cand_parts, _ = self._split_identifier(cand)
-                    bonus = self.scorer.calculate_heuristic_score(cand_parts, entity_type)
+                    bonus = self.scorer.calculate_heuristic_score(
+                        cand_parts,
+                        entity_type,
+                        target_parts=target_parts,
+                        return_type=return_type
+                    )
 
-                # 2. 致命规则拦截 (如 name_name 会返回 -999，直接不进 GPU)
                 if bonus <= -100:
                     continue
 
-                # 3. 微调配额拦截
                 is_triv = self._is_trivial_change(target_name, cand)
                 if is_triv and trivial_added >= max_trivial_allowed:
                     continue
@@ -321,13 +330,11 @@ class HeavyWeightCandidateGenerator:
                     continue
 
                 filtered_chunk.append(cand)
-
                 is_trivial_flags.append(is_triv)
                 heuristic_bonuses.append(bonus)
 
             if not filtered_chunk:
                 continue
-            # ================================================================
 
             semantically_valid = []
 
@@ -339,40 +346,51 @@ class HeavyWeightCandidateGenerator:
                     self.mlm_engine.device)
                 sims = F.cosine_similarity(orig_emb, cand_embs)
 
-                # 将基础分、微调标记和预先算好的修正分一起 zip
                 for cand, sim, is_trivial_change, bonus in zip(filtered_chunk, sims, is_trivial_flags,
                                                                heuristic_bonuses):
                     base_sim_score = sim.item()
-
-                    # 联合打分！
                     final_score = base_sim_score + bonus
-                    current_threshold = base_threshold
 
                     target_parts, _ = self._split_identifier(target_name)
                     cand_parts, _ = self._split_identifier(cand)
 
-                    # 动态阈值调整引擎
-                    if len(target_parts) > 2 and len(cand_parts) > 0:
+                    target_lower_parts = [p.lower() for p in target_parts]
+                    cand_lower_parts = [p.lower() for p in cand_parts]
+
+                    # 计算词根重合度 (是否保留了某个词语)
+                    overlap_count = sum(1 for p in cand_lower_parts if p in target_lower_parts)
+                    has_partial_overlap = overlap_count > 0
+
+                    # ================= 动态阈值引擎 (路由分发) =================
+                    current_threshold = base_threshold
+
+                    if generator_source == 'LLM':
+                        # LLM 生成的长变量 (多词)：容易发散，略微拉高阈值进行收束
+                        if len(target_parts) > 1 or len(cand_parts) > 1:
+                            current_threshold = max(0.75, base_threshold - 0.03)
+                        # 防御：如果 LLM 生成的词极度雷同，说明在偷懒，稍微拉高要求
+                        # if has_partial_overlap:
+                        #     current_threshold = min(0.96, current_threshold + 0.02)
+
+                    elif generator_source == 'MLM':
+                        # MLM 局部微调：保留了部分词语的多词变量
+                        if has_partial_overlap:
+                            if len(target_parts) <= 3 :
+                                # 只改了一部分，如果相似度还不高说明改坏了，较大幅度拉高阈值
+                                current_threshold = min(0.98, base_threshold + 0.08)
+                            # MLM 短变量替换：(如 pvma -> p_vma)，字面全换，适度降低阈值包容多样性
+                            else:
+                                current_threshold = min(0.99, base_threshold + 0.13)
+                        elif len(target_parts) == 1:
+                            current_threshold = base_threshold + 0.02
+
+                    else:
+                        # Fallback (兜底原本的逻辑)
                         if is_trivial_change:
                             current_threshold = min(0.96, base_threshold + 0.08)
-                        else:
-                            # 重新计算 change_ratio 判定大改
-                            identical_count = sum(
-                                1 for p1, p2 in zip(target_parts, cand_parts) if p1.lower() == p2.lower())
-                            change_ratio = 1.0 - (identical_count / max(len(target_parts), len(cand_parts)))
-                            if change_ratio >= 0.6:
-                                current_threshold = max(0.60, base_threshold - 0.15)
-                    elif len(target_parts) == 1:
-                        if len(cand_parts) > 1:
-                            if target_name.lower() in [p.lower() for p in cand_parts]:
-                                current_threshold = min(0.98, base_threshold + 0.10)
-                            else:
-                                current_threshold = min(0.95, base_threshold + 0.05)
-                        else:
-                            if len(cand) <= 3:
-                                current_threshold = max(0.70, base_threshold - 0.05)
 
-                    # 判断依据变为联合打分
+                    # =========================================================
+
                     is_pass = final_score >= current_threshold
                     status = "[PASS]" if is_pass else "[FILTERED]"
 
@@ -400,8 +418,8 @@ class HeavyWeightCandidateGenerator:
                     added += 1
 
         if base_threshold > 0:
-            pass
             # print("-" * 85 + "\n")
+            pass
 
         return added
 
@@ -440,275 +458,279 @@ class HeavyWeightCandidateGenerator:
 
         return local_prefix, local_suffix
 
-    def _generate_core(self, code: str, target_name: str, identifiers: dict,
-                       top_k_mlm: int, top_n_keep: int, semantic_threshold: float,
-                       context_ratio: float, preserve_style: bool, strict_structure: bool) -> List[str]:
-        """Orchestrates the candidate generation process including masking, batch inference, and filtering."""
-        stripped_name = target_name.strip('_')
-        if len(stripped_name) == 0: return []
-        if target_name.startswith('__') and target_name.endswith('__'): return []
+    def _build_llm_prompt(self, context_code: str, target_name: str, style: str, top_n: int, entity_type: str, n_parts: int) -> str:
+        """
+        统一的 LLM 提示词构建器：通过 n_parts 动态切换短变量微调与长变量重构策略。
+        """
+        # ================= 1. 实体词性约束 =================
+        if entity_type == 'VARIABLE':
+            entity_rule = "NO ACTION VERBS: This is a data VARIABLE. DO NOT use verb phrases like 'allocate_'. Use NOUN phrases only (e.g., 'shared_memory_region')."
+        elif entity_type == 'BOOLEAN_VAR':
+            entity_rule = "BOOLEAN STYLE: Use prefixes like 'is_', 'has_' or state nouns."
+        else:
+            entity_rule = "FUNCTION STYLE: This is a FUNCTION. Action verbs are required."
 
-        code_bytes = code.encode("utf-8")
-        if identifiers is None:
-            identifiers = self.analyzer.extract_identifiers(code_bytes)
-        if target_name not in identifiers: return []
+        if n_parts <= 2:
+            max_allowed_parts = n_parts + 1
+            strategy_instruction = f"""[Strategy: Concise Tweaks]
+1. STRICT LENGTH LIMIT: The original name `{target_name}` has {n_parts} word(s). Your generated names MUST contain NO MORE THAN {max_allowed_parts} word(s) in total. 
+   - Example of ALLOWED (≤{max_allowed_parts} words): "shm_info", "mem_data"
+   - Example of FORBIDDEN (>{max_allowed_parts} words): "shared_memory_info", "shared_memory_data_block"
+2. ABBREVIATIONS & SYNONYMS: Prefer idiomatic C/C++ abbreviations (e.g., 'ptr', 'buf', 'mem', 'idx', 'val', 'shm') or extremely short synonyms. Do not over-describe."""
+        else:
+            strategy_instruction = f"""[Strategy: Semantic Refactoring]
+1. PROFESSIONAL SYNONYMS: Use precise terminology that fits the exact system logic but alters the specific words used.
+2. LIMIT LENGTH: The new name must NOT be drastically longer than the original `{target_name}`."""
 
-        if len(stripped_name) == 1:
-            min_freq = self.config.get('min_freq_for_single_char', 3)
-            occurrence_count = len(identifiers[target_name])
-            if occurrence_count < min_freq:
-                return []
+        # ================= 3. 组装最终 Prompt =================
+        return f"""You are an expert Linux/C/C++ kernel developer. Analyze the snippet and suggest exactly {top_n} alternative names for `{target_name}`.
 
-        original_style = self._detect_naming_style(target_name)
+[Context Code]
+```cpp
+{context_code}
+{strategy_instruction}
+
+[Strict Rules]
+
+{entity_rule}
+
+STYLE MATCH: Strictly use the {style} naming convention.
+
+NO PLACEHOLDERS: Never use generic names like "new_variable_1", "var_a", or "temp".
+
+FORMAT: Output ONLY a JSON array of strings. Do not explain.
+
+Now, generate the JSON array for {target_name}:"""
+
+    def generate_candidates(self, code_str: str, target_name: str, top_k_mlm: int = 40, top_n_keep: int = 50) -> List[
+        str]:
+        """
+        [精细化配额混合架构]
+        - 覆盖所有变量：LLM 和 MLM 均参与生成。
+        - 严格配额控制：LLM 的高质量语义重构占比 40%，MLM 的局部微调占比 60%。
+        - MLM 增强：为多词变量挖掘 1 到 2 个洞，实现适度重构与极速计算的平衡。
+        """
+        import itertools
+
+        code_bytes = code_str.encode("utf-8")
+        identifiers = self.analyzer.extract_identifiers(code_bytes)
+        if target_name not in identifiers:
+            return []
+
+        # 1. 提取元数据与上下文
         best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
         target_info = identifiers[target_name][best_occ_idx]
 
-        # ==================== 新增：提取并判定实体类型 ====================
         raw_entity_type = target_info.get('entity_type', 'variable')
         entity_type = 'FUNCTION' if raw_entity_type == 'function' else 'VARIABLE'
-        # 启发式兜底判断：如果是 is_ 开头的变量，视为布尔值
-        if entity_type == 'VARIABLE' and stripped_name.startswith(('is_', 'has_', 'can_', 'should_')):
+        if entity_type == 'VARIABLE' and target_name.startswith(('is_', 'has_', 'can_', 'should_')):
             entity_type = 'BOOLEAN_VAR'
-        # ================================================================
 
-        prefix = code_bytes[:target_info['start']]
-        suffix = code_bytes[target_info['end']:]
-
-        local_prefix, local_suffix = self._extract_local_context_ast(
-            code_bytes, target_info['start'], target_info['end']
-        )
-
+        original_style = self._detect_naming_style(target_name)
         parts, style = self._split_identifier(target_name)
         n_parts = len(parts)
 
-        if n_parts > 10: return []
+        local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, target_info['start'],
+                                                                     target_info['end'])
 
-        target_lengths = [len(p) for p in parts]
+        # 用于组装复合词的内部闭包函数
+        def _join_parts(new_parts):
+            if style == '_':
+                return "_".join(new_parts)
+            elif style == 'camel':
+                return "".join(p.lower() if j == 0 and target_name[0].islower() else p.capitalize() for j, p in
+                               enumerate(new_parts))
+            return "".join(new_parts)
+
+        # 两个独立的原始候选词池
+        raw_mlm_cands = []
+        raw_llm_cands = []
+
         mask_token = self.mlm_engine.tokenizer.mask_token
 
-        dynamic_top_k = max(3, top_k_mlm // max(1, (n_parts - 1)))
-        variations = []
-
-        if n_parts == 1 and not strict_structure:
-            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'none'})
-            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'prefix'})
-            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 1, 'expand_mode': 'suffix'})
-            variations.append({'type': 'full', 'start': 0, 'end': 1, 'num_masks': 2, 'expand_mode': 'both'})
-
-        # ==================== 复合词变体生成 (受控滑动窗口版) ====================
-        elif strict_structure:
-            # 完整替换 (max 洞)
-            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts, 'expand_mode': 'none'})
-            if n_parts > 1:
-                for s in range(n_parts):
-                    for e in range(s + 1, n_parts + 1):
-                        if s == 0 and e == n_parts: continue
-
-                        mask_len = e - s
-                        # 核心改动：保留 1个词、2个词 和 max-1 个词的滑动窗口，跳过中间长度
-                        if mask_len > 2 and mask_len != (n_parts - 1):
-                            continue
-
-                        variations.append(
-                            {'type': 'sub', 'start': s, 'end': e, 'num_masks': mask_len, 'expand_mode': 'none'})
-        else:
-            # 非严格模式的完整替换
-            variations.append({'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': 1, 'expand_mode': 'none'})
-            if n_parts > 1:
-                variations.append(
-                    {'type': 'full', 'start': 0, 'end': n_parts, 'num_masks': n_parts, 'expand_mode': 'none'})
-
-                for s in range(n_parts):
-                    for e in range(s + 1, n_parts + 1):
-                        if s == 0 and e == n_parts: continue
-
-                        mask_len = e - s
-                        # 核心改动：保留 1个词、2个词 和 max-1 个词的滑动窗口
-                        if mask_len > 2 and mask_len != (n_parts - 1):
-                            continue
-
-                        variations.append({'type': 'sub', 'start': s, 'end': e, 'num_masks': 1, 'expand_mode': 'none'})
-                        if mask_len > 1:
-                            variations.append(
-                                {'type': 'sub', 'start': s, 'end': e, 'num_masks': mask_len, 'expand_mode': 'none'})
-
-        cropped_codes = []
+        # =========================================================
+        # 引擎 A：MLM 局部特征扰动 (1~2个洞)
+        # =========================================================
         context_half = 700
-        mask_start = len(prefix)
+        prefix_str = local_prefix[max(0, len(local_prefix) - context_half):]
+        suffix_str = local_suffix[:context_half]
 
-        prefix_str = prefix[max(0, mask_start - context_half):].decode("utf-8", errors="replace")
-        suffix_str = suffix[:context_half].decode("utf-8", errors="replace")
+        variations = []
+        if n_parts == 1:
+            variations.append({'expand_mode': 'none', 'num_masks': 1, 'masked_str': mask_token})
+            variations.append({'expand_mode': 'prefix', 'num_masks': 1, 'masked_str': f"{mask_token}_{target_name}"})
+            variations.append({'expand_mode': 'suffix', 'num_masks': 1, 'masked_str': f"{target_name}_{mask_token}"})
+        else:
+            # 挖 1 个洞 (局部单词微调)
+            for i in range(n_parts):
+                masked_var = self._build_masked_string(parts, i, i + 1, 1, style, mask_token, target_name)
+                variations.append(
+                    {'expand_mode': 'sub', 'start': i, 'end': i + 1, 'num_masks': 1, 'masked_str': masked_var})
 
-        for var in variations:
-            expand_mode = var.get('expand_mode', 'none')
-            if expand_mode == 'none':
-                masked_var = self._build_masked_string(parts, var['start'], var['end'], var['num_masks'], style,
-                                                       mask_token, target_name)
-            elif expand_mode == 'prefix':
-                masked_var = f"{mask_token}_{target_name}"
-            elif expand_mode == 'suffix':
-                masked_var = f"{target_name}_{mask_token}"
-            elif expand_mode == 'both':
-                masked_var = f"{mask_token}_{mask_token}"
+            # 挖 2 个洞 (连词替换)
+            if n_parts >= 2:
+                for i in range(n_parts - 1):
+                    masked_var = self._build_masked_string(parts, i, i + 2, 2, style, mask_token, target_name)
+                    variations.append(
+                        {'expand_mode': 'sub', 'start': i, 'end': i + 2, 'num_masks': 2, 'masked_str': masked_var})
 
-            cropped_code = prefix_str + masked_var + suffix_str
-            cropped_codes.append(cropped_code)
-
+        cropped_codes = [prefix_str + v['masked_str'] + suffix_str for v in variations]
         batch_logits, batch_mask_indices = self._get_model_logits_batched(cropped_codes)
-
-        raw_full_cands, raw_sub_cands_lists = [], []
 
         if batch_logits is not None:
             for i, var in enumerate(variations):
                 logits = batch_logits[i:i + 1]
                 mask_indices = batch_mask_indices[i]
                 expand_mode = var.get('expand_mode', 'none')
+                num_masks = var.get('num_masks', 1)
 
-                if len(mask_indices) < var['num_masks']: continue
+                if len(mask_indices) < num_masks: continue
 
-                current_cands = []
-
-                if expand_mode != 'none':
-                    # 【核心提速】大幅限制 expansion 模式生成的候选词数量，防止短变量发生低质组合爆炸
-                    expand_top_k = min(15, max(3, dynamic_top_k // 3))
-                    if expand_mode == 'prefix':
-                        words = self._decode_words(logits[0, mask_indices[0], :], expand_top_k, allow_underscore=False)
-                        for w in words: current_cands.append(f"{w}_{target_name}")
-                    elif expand_mode == 'suffix':
-                        words = self._decode_words(logits[0, mask_indices[0], :], expand_top_k, allow_underscore=False)
-                        for w in words: current_cands.append(f"{target_name}_{w}")
-                    elif expand_mode == 'both':
-                        per_mask_top_k = min(5, max(2, dynamic_top_k // 6))
-                        words1 = self._decode_words(logits[0, mask_indices[0], :], per_mask_top_k,
-                                                    allow_underscore=False)
-                        words2 = self._decode_words(logits[0, mask_indices[1], :], per_mask_top_k,
-                                                    allow_underscore=False)
-
-                        MAX_EXPAND_COMBOS = 15  # 从 50 降到 15，避免产生大量无效拼凑
-                        combo_count = 0
-                        for w1, w2 in itertools.product(words1, words2):
-                            if combo_count >= MAX_EXPAND_COMBOS: break
-                            current_cands.append(f"{w1}_{w2}")
-                            combo_count += 1
-                else:
-                    if var['num_masks'] == 1:
-                        per_mask_top_k = min(20, dynamic_top_k)
-                    elif var['num_masks'] == 2:
-                        per_mask_top_k = min(8, max(3, dynamic_top_k // 2))
-                    elif var['num_masks'] >= n_parts - 1 and var['num_masks'] >= 3:
-                        # 对于大跨度重构，每个洞只给极少量的顶级候选词
-                        per_mask_top_k = 3
-                    else:
-                        per_mask_top_k = min(4, max(2, dynamic_top_k // 3))
-
-                    # 2. 【核心提速】限制解码深度：不再解码几百个词，而是只解码略多于 per_mask_top_k 的数量
-                    # 这样可以减少 _decode_words 内部字符串处理和正则过滤的开销
-                    decode_budget = per_mask_top_k * 2 if not strict_structure else per_mask_top_k * 3
-
-                    mask_preds = []
-                    for m_idx in range(var['num_masks']):
-                        part_idx = var['start'] + m_idx if strict_structure else None
-                        req_len = target_lengths[part_idx] if strict_structure else None
-
-                        # 使用受限的 decode_budget 进行解码
-                        words = self._decode_words(
-                            logits[0, mask_indices[m_idx], :],
-                            decode_budget, # <--- 关键修改：直接限制 MLM 解码深度
-                            allow_underscore=False,
-                            required_length=req_len
-                        )
-
-                        # 截取最终需要的数量
-                        words = words[:per_mask_top_k]
-
-                        if strict_structure and not words:
-                            words = [parts[part_idx]]
-                        elif not strict_structure and not words:
-                            words = ['temp']
-                        mask_preds.append(words)
-
-                    # ==================== 组合上限拦截 (CPU 保护) ====================
-                    if var['num_masks'] >= n_parts - 1 and var['num_masks'] >= 3:
-                        MAX_COMBINATIONS = 20  # 稍微调低大跨度重构组合
-                    else:
-                        MAX_COMBINATIONS = 100 if var['num_masks'] > 1 else 30
-
-                    combo_count = 0
-                    for combo in itertools.product(*mask_preds):
-                        if combo_count >= MAX_COMBINATIONS: break
-                        combo_count += 1
-                        cand = self._assemble_multi_candidate(parts, var['start'], var['end'], combo, style, target_name)
-                        # ... 剩下的逻辑保持不变 ...
-                        if strict_structure:
-                            if [len(p) for p in self._split_identifier(cand)[0]] == target_lengths:
-                                current_cands.append(cand)
+                if num_masks == 1:
+                    words = self._decode_words(logits[0, mask_indices[0], :], top_k_mlm, allow_underscore=False)
+                    for w in words:
+                        if expand_mode == 'prefix':
+                            raw_mlm_cands.append(f"{w}_{target_name}")
+                        elif expand_mode == 'suffix':
+                            raw_mlm_cands.append(f"{target_name}_{w}")
                         else:
-                            current_cands.append(cand)
+                            if n_parts == 1:
+                                raw_mlm_cands.append(w)
+                            else:
+                                new_parts = parts[:var['start']] + [w] + parts[var['end']:]
+                                raw_mlm_cands.append(_join_parts(new_parts))
 
-                if var['type'] == 'full':
-                    raw_full_cands.extend(current_cands)
+                elif num_masks == 2:
+                    # 对于 2 个洞，使用极小的 top_k (如 4) 进行组合，4x4=16，防止组合爆炸
+                    top_k_2holes = min(4, max(2, top_k_mlm // 4))
+                    words1 = self._decode_words(logits[0, mask_indices[0], :], top_k_2holes, allow_underscore=False)
+                    words2 = self._decode_words(logits[0, mask_indices[1], :], top_k_2holes, allow_underscore=False)
+
+                    for w1, w2 in itertools.product(words1, words2):
+                        new_parts = parts[:var['start']] + [w1, w2] + parts[var['end']:]
+                        raw_mlm_cands.append(_join_parts(new_parts))
+
+        # =========================================================
+        # 引擎 B：LLM 全局语义重构 (覆盖所有变量长度)
+        # =========================================================
+        start_idx = max(0, target_info['start'] - 400)
+        end_idx = min(len(code_bytes), target_info['end'] + 400)
+        context_block = code_bytes[start_idx:end_idx].decode("utf-8", errors="replace")
+
+        prompt = self._build_llm_prompt(
+            context_code=context_block,
+            target_name=target_name,
+            style=original_style,
+            top_n=top_n_keep * 2,
+            entity_type=entity_type,
+            n_parts=n_parts  # <--- 将 n_parts 传给 Prompt 用于动态字数限制
+        )
+        try:
+            llm_response = self.llm_client.chat(prompt)
+            json_match = re.search(r'\[(.*?)\]', llm_response, re.DOTALL)
+            llm_cands_parsed = json.loads(f"[{json_match.group(1)}]") if json_match else json.loads(llm_response)
+        except Exception as e:
+            llm_cands_parsed = re.findall(r'"([a-zA-Z0-9_]+)"', llm_response if 'llm_response' in locals() else "")
+
+        for c in llm_cands_parsed:
+            if isinstance(c, str) and c.strip():
+                clean_cand = c.strip()
+
+                cand_parts_list, _ = self._split_identifier(clean_cand)
+
+                if n_parts <= 2:
+                    if len(cand_parts_list) > (n_parts + 1):
+                        # print(f"[拦截] LLM 不听话，生成了超长词汇: {clean_cand}")
+                        continue
                 else:
-                    raw_sub_cands_lists.append(current_cands)
+                    # 对于长变量，防止它无限膨胀 (比如限制最多比原词多 2 个 part)
+                    if len(cand_parts_list) > (n_parts + 2):
+                        continue
+                # ====================================================
 
-        unique_full = list(dict.fromkeys(raw_full_cands))
-        unique_sub = []
-        seen_sub = set()
-        if raw_sub_cands_lists:
-            max_len = max(len(lst) for lst in raw_sub_cands_lists)
-            for j in range(max_len):
-                for lst in raw_sub_cands_lists:
-                    if j < len(lst) and lst[j] not in seen_sub:
-                        seen_sub.add(lst[j])
-                        unique_sub.append(lst[j])
+                raw_llm_cands.append(clean_cand)
+
+        # =========================================================
+        # 统一去重与 4:6 配额过滤漏斗
+        # =========================================================
+        unique_llm_cands = list(dict.fromkeys(raw_llm_cands))
+        unique_mlm_cands = list(dict.fromkeys(raw_mlm_cands))
+
+        # 计算配额：40% 给 LLM, 60% 给 MLM
+        quota_llm = max(1, int(top_n_keep * 0.40))
+        quota_mlm = top_n_keep - quota_llm
+
+        # 动态基准线
+        base_thresh = self.config.get('semantic_threshold', 0.85)
+        current_base_thresh = max(0.75, base_thresh - 0.05) if n_parts > 1 else base_thresh
+
+        all_usages = identifiers[target_name]
+        found_return_type = next((u['return_type'] for u in all_usages if u.get('return_type')), None)
 
         ctx = {
-            'code_bytes': code_bytes, 'target_name': target_name, 'identifiers': identifiers,
-            'keywords': self.analyzer.keywords, 'original_style': original_style,
+            'code_bytes': code_bytes,
+            'target_name': target_name,
+            'identifiers': identifiers,
+            'keywords': self.analyzer.keywords,
+            'original_style': original_style,
             'local_prefix': local_prefix,
             'local_suffix': local_suffix,
-            'semantic_threshold': semantic_threshold, 'preserve_style': preserve_style,
-            'entity_type': entity_type
+            'semantic_threshold': current_base_thresh,
+            'preserve_style': self.config.get('preserve_style', True),
+            'entity_type': entity_type,
+            'return_type': found_return_type
         }
 
         final_candidates = []
 
-        # ==================== 修复单字变量 15 个限制的 Bug ====================
-        if not unique_sub:
-            target_full_quota = top_n_keep
-        else:
-            target_full_quota = int(top_n_keep * context_ratio)
+        # 1. 优先结算 LLM 配额 (最高 40%)
+        llm_added = self._verify_and_filter(
+            candidate_list=unique_llm_cands,
+            quota=quota_llm,
+            final_candidates=final_candidates,
+            ctx=ctx,
+            is_full_context=True,
+            generator_source='LLM'  # <--- 明确注入 LLM 源
+        )
 
-        actual_full = self._verify_and_filter(unique_full, target_full_quota, final_candidates, ctx,
-                                              is_full_context=True)
+        # 2. 结算 MLM 配额 (60% + 填补 LLM 未完成的配额)
+        mlm_actual_quota = top_n_keep - len(final_candidates)
+        self._verify_and_filter(
+            candidate_list=unique_mlm_cands,
+            quota=mlm_actual_quota,
+            final_candidates=final_candidates,
+            ctx=ctx,
+            is_full_context=True,
+            generator_source='MLM'  # <--- 明确注入 MLM 源
+        )
 
-        if unique_sub:
-            self._verify_and_filter(unique_sub, top_n_keep - actual_full, final_candidates, ctx, is_full_context=False)
+        # 3. 后备兜底
+        if len(final_candidates) < top_n_keep:
+            remaining_llm = [c for c in unique_llm_cands if c not in final_candidates]
+            self._verify_and_filter(
+                candidate_list=remaining_llm,
+                quota=top_n_keep - len(final_candidates),
+                final_candidates=final_candidates,
+                ctx=ctx,
+                is_full_context=True,
+                generator_source='LLM'  # <--- 兜底的也是 LLM
+            )
 
-        if strict_structure and len(final_candidates) < top_n_keep:
-            if hasattr(self, '_generate_structural_fallback'):
-                local_cands = self._generate_structural_fallback(code_bytes, target_name, identifiers,
-                                                                 top_n_keep - len(final_candidates))
-                for lc in local_cands:
-                    if lc not in final_candidates and self.analyzer.can_rename_to(code_bytes, target_name, lc):
-                        final_candidates.append(lc)
-
-        if len(final_candidates) > top_n_keep:
-            return random.sample(final_candidates, top_n_keep)
         return final_candidates
 
-    def generate_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
-        """Performs standard context-aware candidate generation."""
-        return self._generate_core(
-            code=code,
-            target_name=target_name,
-            identifiers=identifiers,
-            top_k_mlm=self.config['top_k_mlm'],
-            top_n_keep=self.config['top_n_keep'],
-            semantic_threshold=self.config['semantic_threshold'],
-            context_ratio=self.config['context_ratio'],
-            preserve_style=self.config['preserve_style'],
-            strict_structure=False
-        )
+    # def generate_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
+    #     """Performs standard context-aware candidate generation."""
+    #     return self._generate_core(
+    #         code=code,
+    #         target_name=target_name,
+    #         identifiers=identifiers,
+    #         top_k_mlm=self.config['top_k_mlm'],
+    #         top_n_keep=self.config['top_n_keep'],
+    #         semantic_threshold=self.config['semantic_threshold'],
+    #         context_ratio=self.config['context_ratio'],
+    #         preserve_style=self.config['preserve_style'],
+    #         strict_structure=False
+    #     )
 
     def generate_structural_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
         """Generates isomorphic candidates by enforcing strict naming style and structural consistency."""

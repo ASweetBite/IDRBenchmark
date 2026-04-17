@@ -67,6 +67,8 @@ class IdentifierAnalyzer:
         tree = parser.parse(source_code)
         identifiers = defaultdict(list)
 
+        defined_names = set()
+
         scope_stack = [{
             "id": 0,
             "start": 0,
@@ -97,23 +99,16 @@ class IdentifierAnalyzer:
             cursor = QueryCursor(self.ast_query)
             captures = cursor.captures(tree.root_node)
 
-            # 兼容不同版本 tree-sitter 返回格式，统一转换为 [(node, tag)] 格式
         if isinstance(captures, dict):
-            # 某些旧版本返回 {tag: [node1, node2]}
             flat_captures = [(node, tag) for tag, nodes in captures.items() for node in
                              (nodes if isinstance(nodes, list) else [nodes])]
         else:
-            # 新版本 QueryCursor 通常返回生成器或元组列表 [(node, tag)]
             flat_captures = list(captures)
 
-        # 2. 排序保证逻辑严格一致：按起始字节升序，结束字节降序
-        # 这样确保父作用域节点总是先于其内部的标识符被处理，完美模拟先序遍历
         flat_captures.sort(key=lambda x: (x[0].start_byte, -x[0].end_byte))
 
-        # 3. 线性遍历过滤后的目标节点
         for node, tag in flat_captures:
 
-            # 动态维护 Scope 栈：如果当前节点的起始位置超出了栈顶作用域的结束位置，说明离开了该作用域
             while len(scope_stack) > 1 and scope_stack[-1]["end"] <= node.start_byte:
                 scope_stack.pop()
 
@@ -148,6 +143,46 @@ class IdentifierAnalyzer:
 
                 # 确认是目标变量后，再进行解码
                 name = name_bytes.decode("utf-8")
+
+                is_def = False
+                curr_node = node
+                while curr_node:
+                    parent = curr_node.parent
+                    if not parent:
+                        break
+
+                    # 1. 明确的“使用”场景：作为初始化右值、或数组长度参数
+                    if parent.type == 'init_declarator' and parent.child_by_field_name('value') == curr_node:
+                        break
+                    if parent.type == 'array_declarator' and parent.child_by_field_name('size') == curr_node:
+                        break
+
+                    # 2. 如果遇到任何表达式或执行语句，说明它是被调用/使用的变量或函数（例如宏替换、外部全局变量运算）
+                    if parent.type in {
+                        'binary_expression', 'unary_expression', 'update_expression',
+                        'assignment_expression', 'call_expression', 'subscript_expression',
+                        'conditional_expression', 'initializer_list', 'initializer',
+                        'argument_list', 'return_statement', 'expression_statement',
+                        'if_statement', 'while_statement', 'do_statement', 'switch_statement',
+                        'case_statement', 'parenthesized_expression', 'cast_expression',
+                        'comma_expression', 'sizeof_expression', 'type_descriptor'
+                    }:
+                        break
+
+                    # 3. 成功到达声明/定义层级，确认此标识符在当前片段中有被定义
+                    if parent.type in {
+                        'declaration', 'parameter_declaration', 'function_definition',
+                        'field_declaration', 'catch_declaration', 'optional_parameter_declaration',
+                        'struct_specifier', 'class_specifier', 'enum_specifier'
+                    }:
+                        is_def = True
+                        break
+
+                    curr_node = parent
+
+                if is_def:
+                    defined_names.add(name)
+                # =====================================================================
 
                 is_func_decl = False
                 curr = node.parent
@@ -190,6 +225,25 @@ class IdentifierAnalyzer:
 
                 is_plain_field = (node.type == "field_identifier" and not is_method_call and not is_func_decl)
 
+                # =====================================================================
+                # [新增逻辑] 提取函数返回值类型 / 变量声明类型
+                # =====================================================================
+                extracted_type = None
+                # 只有在它是定义/声明节点时，才能在 AST 中稳定找到类型
+                if is_def or is_func_decl:
+                    decl_node = node.parent
+                    while decl_node and decl_node.type not in {
+                        'function_definition', 'declaration', 'field_declaration',
+                        'parameter_declaration', 'optional_parameter_declaration'
+                    }:
+                        decl_node = decl_node.parent
+
+                    if decl_node:
+                        type_node = decl_node.child_by_field_name('type')
+                        if type_node:
+                            extracted_type = source_code[type_node.start_byte:type_node.end_byte].decode("utf-8")
+                # =====================================================================
+
                 if not is_constructor and not is_plain_field:
                     current_scope = scope_stack[-1]
                     identifiers[name].append({
@@ -198,10 +252,17 @@ class IdentifierAnalyzer:
                         "scope": current_scope["id"],
                         "scope_start": current_scope["start"],
                         "scope_end": current_scope["end"],
-                        "entity_type": entity_type
+                        "entity_type": entity_type,
+                        "return_type": extracted_type  # 统一存入 return_type 字段
                     })
 
-        return dict(identifiers)
+        filtered_identifiers = {
+            name: usages
+            for name, usages in identifiers.items()
+            if name in defined_names
+        }
+
+        return filtered_identifiers
 
     def get_identifier_scope_ranges(self, source_code: bytes, var_name: str):
         """Returns a list of start and end byte ranges defining the scope of a given identifier."""

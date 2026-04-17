@@ -1,13 +1,13 @@
-from typing import List, Dict
 import json
 import os
-from attacks.optimizers import GeneticAlgorithmOptimizer, GreedyOptimizer
+from typing import List, Dict
+
+from attacks.optimizers import GeneticAlgorithmOptimizer, GreedyOptimizer, BeamSearchOptimizer, BayesianOptimizer
 from attacks.rankers import RNNS_Ranker
-from utils.model_zoo import ModelZoo
 
 
 class IRTGAttacker:
-    def __init__(self, model_zoo: ModelZoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, mode: str, config: dict):
+    def __init__(self, model_zoo, get_all_vars_fn, get_subs_pool_fn, rename_fn, mode: str, config: dict):
         """Initializes the attacker with model environments, function pointers, and configuration parameters."""
         self.model_zoo = model_zoo
         self.model_names = model_zoo.model_names
@@ -21,7 +21,13 @@ class IRTGAttacker:
         self.top_k = irtg_config.get('top_k', 5)
         self.iterations = run_params.get('iterations', 10)
         self.run_mode = run_params.get('run_mode', 'attack')
-        self.optimizer_type = run_params.get('algorithm', 'greedy').lower()
+
+        # 强制转换为小写，支持 'greedy', 'beam', 'ga', 'bo' 四种算法
+        self.optimizer_type = str(run_params.get('algorithm', 'greedy')).lower()
+        if self.optimizer_type not in ["greedy", "beam", "ga", "bo"]:
+            raise ValueError(
+                f"Unsupported algorithm: {self.optimizer_type}. Must be one of ['greedy', 'beam', 'ga', 'bo'].")
+
         self.result_dir = global_config.get('result_dir', './results')
 
         self.attacker_params = {
@@ -40,20 +46,24 @@ class IRTGAttacker:
 
         rankers = {m: RNNS_Ranker(self.model_zoo, m, self.attacker_params["rename_fn"]) for m in self.model_names}
 
+        # 1. 动态实例化所选的优化算法
         optimizers = {}
         for m in self.model_names:
+            opt_kwargs = {
+                "model_zoo": self.model_zoo,
+                "target_model": m,
+                "rename_fn": self.attacker_params["rename_fn"],
+                "mode": self.mode,
+                "config": self.config
+            }
             if self.optimizer_type == "greedy":
-                optimizers[m] = GreedyOptimizer(
-                    self.model_zoo, m, self.attacker_params["rename_fn"],
-                    mode=self.mode,
-                    config=self.config
-                )
-            else:
-                optimizers[m] = GeneticAlgorithmOptimizer(
-                    self.model_zoo, m, self.attacker_params["rename_fn"],
-                    mode=self.mode,
-                    config=self.config
-                )
+                optimizers[m] = GreedyOptimizer(**opt_kwargs)
+            elif self.optimizer_type == "beam":
+                optimizers[m] = BeamSearchOptimizer(**opt_kwargs)
+            elif self.optimizer_type == "ga":
+                optimizers[m] = GeneticAlgorithmOptimizer(**opt_kwargs)
+            elif self.optimizer_type == "bo":
+                optimizers[m] = BayesianOptimizer(**opt_kwargs)
 
         for idx, sample in enumerate(dataset):
             code = sample["code"]
@@ -78,27 +88,53 @@ class IRTGAttacker:
             for atk_model in self.model_names:
                 orig_pred = orig_predictions[atk_model]["pred"]
 
-                print(f"\n[Sample {idx + 1}] Target={atk_model} | Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)...")
+                print(
+                    f"\n[Sample {idx + 1}] Target={atk_model} | Optimizer={self.optimizer_type.upper()} ({self.run_mode} mode)...")
                 stats[atk_model][atk_model]["total"] += 1
 
-                if self.optimizer_type == "greedy":
+                rnns_best_seed = None
+
+                # 2. 区分全局搜索与启发式降维搜索
+                if self.optimizer_type in ["greedy", "beam"]:
+                    # Greedy 和 Beam 直接在全局变量空间搜索
                     target_vars = variables.copy()
                     target_scores = None
                 else:
+                    # GA 和 BO 依赖 RNNS 进行前置薄弱点探测
                     print("RNNS-Start...")
-                    ranked_vars, all_scores = rankers[atk_model].rank_variables(
+                    rnns_output = rankers[atk_model].rank_variables(
                         code=code, variables=variables.copy(), subs_pool=subs_pool, reference_label=orig_pred,
                         top_k=max(self.top_k, int(len(variables) * 0.3))
                     )
+
+                    # 兼容处理：检查 RNNS 是否返回了用于 GA 优化的最佳种子字典
+                    if len(rnns_output) == 3:
+                        ranked_vars, all_scores, rnns_best_seed = rnns_output
+                    else:
+                        ranked_vars, all_scores = rnns_output
+
                     target_vars = ranked_vars
                     target_scores = {var: all_scores[var] for var in target_vars}
 
                 print(f"{self.optimizer_type.upper()}-Start...")
-                is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(
-                    code=code, original_pred=orig_pred, target_vars=target_vars,
-                    subs_pool=subs_pool, variable_scores=target_scores
-                )
 
+                # 3. 动态组织运行参数
+                run_kwargs = {
+                    "code": code,
+                    "original_pred": orig_pred,
+                    "target_vars": target_vars,
+                    "subs_pool": subs_pool,
+                    "variable_scores": target_scores
+                }
+
+                # 如果是遗传算法且存在 RNNS 探测到的极佳词组，注入种子
+                if self.optimizer_type == "ga" and rnns_best_seed:
+                    run_kwargs["rnns_best_seed"] = rnns_best_seed
+
+                # 执行攻击
+                is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(**run_kwargs)
+
+                # 后续记录及可迁移性测试逻辑保持不变
                 if self.run_mode == "dataset":
                     storage_orig[atk_model].append({"func": code, "label": ground_truth})
                     storage_adv[atk_model].append({"func": adv_code, "label": ground_truth})
