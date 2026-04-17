@@ -1,8 +1,9 @@
+import itertools
 import json
 import random
 import re
 from collections import defaultdict
-from typing import List
+from typing import List, Dict, Any
 
 import torch
 import torch.nn.functional as F
@@ -502,87 +503,157 @@ FORMAT: Output ONLY a JSON array of strings. Do not explain.
 
 Now, generate the JSON array for {target_name}:"""
 
-    def generate_candidates(self, code_str: str, target_name: str, top_k_mlm: int = 40, top_n_keep: int = 50) -> List[
-        str]:
+    def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 50) -> \
+    Dict[str, List[str]]:
         """
-        [精细化配额混合架构]
-        - 覆盖所有变量：LLM 和 MLM 均参与生成。
-        - 严格配额控制：LLM 的高质量语义重构占比 40%，MLM 的局部微调占比 60%。
-        - MLM 增强：为多词变量挖掘 1 到 2 个洞，实现适度重构与极速计算的平衡。
+        批量候选词生成架构：极大提升 GPU 并行利用率
+        :param batch_tasks: 列表，每个元素形如 {"target_name": "var_name", "code_str": "sliced_context"}
+        :return: 字典，{ "var_name": ["cand1", "cand2", ...] }
         """
-        import itertools
+        results = {task["target_name"]: [] for task in batch_tasks}
 
-        code_bytes = code_str.encode("utf-8")
-        identifiers = self.analyzer.extract_identifiers(code_bytes)
-        if target_name not in identifiers:
-            return []
+        # 用于记录和分发批处理结果的追踪器
+        mlm_tracking = []  # 记录所有展平的 MLM 变体
+        llm_prompts = []  # 记录所有 LLM Prompt
+        llm_task_mapping = []  # 记录 prompt 对应哪个 task 的索引
 
-        # 1. 提取元数据与上下文
-        best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
-        target_info = identifiers[target_name][best_occ_idx]
-
-        raw_entity_type = target_info.get('entity_type', 'variable')
-        entity_type = 'FUNCTION' if raw_entity_type == 'function' else 'VARIABLE'
-        if entity_type == 'VARIABLE' and target_name.startswith(('is_', 'has_', 'can_', 'should_')):
-            entity_type = 'BOOLEAN_VAR'
-
-        original_style = self._detect_naming_style(target_name)
-        parts, style = self._split_identifier(target_name)
-        n_parts = len(parts)
-
-        local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, target_info['start'],
-                                                                     target_info['end'])
-
-        # 用于组装复合词的内部闭包函数
-        def _join_parts(new_parts):
-            if style == '_':
-                return "_".join(new_parts)
-            elif style == 'camel':
-                return "".join(p.lower() if j == 0 and target_name[0].islower() else p.capitalize() for j, p in
-                               enumerate(new_parts))
-            return "".join(new_parts)
-
-        # 两个独立的原始候选词池
-        raw_mlm_cands = []
-        raw_llm_cands = []
+        task_metadata = {}  # 存储每个 task 的解析状态 (parts, style, prefix, suffix 等)
 
         mask_token = self.mlm_engine.tokenizer.mask_token
 
         # =========================================================
-        # 引擎 A：MLM 局部特征扰动 (1~2个洞)
+        # Phase 1: 请求收集与预处理 (CPU 计算，极快)
         # =========================================================
-        context_half = 700
-        prefix_str = local_prefix[max(0, len(local_prefix) - context_half):]
-        suffix_str = local_suffix[:context_half]
+        for task_idx, task in enumerate(batch_tasks):
+            target_name = task["target_name"]
+            code_str = task["code_str"]
+            code_bytes = code_str.encode("utf-8")
 
-        variations = []
-        if n_parts == 1:
-            variations.append({'expand_mode': 'none', 'num_masks': 1, 'masked_str': mask_token})
-            variations.append({'expand_mode': 'prefix', 'num_masks': 1, 'masked_str': f"{mask_token}_{target_name}"})
-            variations.append({'expand_mode': 'suffix', 'num_masks': 1, 'masked_str': f"{target_name}_{mask_token}"})
-        else:
-            # 挖 1 个洞 (局部单词微调)
-            for i in range(n_parts):
-                masked_var = self._build_masked_string(parts, i, i + 1, 1, style, mask_token, target_name)
+            identifiers = self.analyzer.extract_identifiers(code_bytes)
+            if target_name not in identifiers:
+                continue
+
+            best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
+            target_info = identifiers[target_name][best_occ_idx]
+
+            # 实体类型判定
+            raw_entity_type = target_info.get('entity_type', 'variable')
+            entity_type = 'FUNCTION' if raw_entity_type == 'function' else 'VARIABLE'
+            if entity_type == 'VARIABLE' and target_name.startswith(('is_', 'has_', 'can_', 'should_')):
+                entity_type = 'BOOLEAN_VAR'
+
+            original_style = self._detect_naming_style(target_name)
+            parts, style = self._split_identifier(target_name)
+            n_parts = len(parts)
+
+            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, target_info['start'],
+                                                                         target_info['end'])
+
+            # 记录 Metadata 供后续组装和过滤使用
+            task_metadata[task_idx] = {
+                "target_name": target_name,
+                "parts": parts,
+                "style": style,
+                "n_parts": n_parts,
+                "identifiers": identifiers,
+                "entity_type": entity_type,
+                "original_style": original_style,
+                "code_bytes": code_bytes,
+                "local_prefix": local_prefix,
+                "local_suffix": local_suffix,
+                "raw_mlm_cands": [],
+                "raw_llm_cands": []
+            }
+
+            # ---------------- 收集 MLM 任务 ----------------
+            context_half = 700
+            prefix_str = local_prefix[max(0, len(local_prefix) - context_half):]
+            suffix_str = local_suffix[:context_half]
+
+            variations = []
+            if n_parts == 1:
+                variations.append({'expand_mode': 'none', 'num_masks': 1, 'masked_str': mask_token})
                 variations.append(
-                    {'expand_mode': 'sub', 'start': i, 'end': i + 1, 'num_masks': 1, 'masked_str': masked_var})
-
-            # 挖 2 个洞 (连词替换)
-            if n_parts >= 2:
-                for i in range(n_parts - 1):
-                    masked_var = self._build_masked_string(parts, i, i + 2, 2, style, mask_token, target_name)
+                    {'expand_mode': 'prefix', 'num_masks': 1, 'masked_str': f"{mask_token}_{target_name}"})
+                variations.append(
+                    {'expand_mode': 'suffix', 'num_masks': 1, 'masked_str': f"{target_name}_{mask_token}"})
+            else:
+                for i in range(n_parts):
+                    masked_var = self._build_masked_string(parts, i, i + 1, 1, style, mask_token, target_name)
                     variations.append(
-                        {'expand_mode': 'sub', 'start': i, 'end': i + 2, 'num_masks': 2, 'masked_str': masked_var})
+                        {'expand_mode': 'sub', 'start': i, 'end': i + 1, 'num_masks': 1, 'masked_str': masked_var})
+                if n_parts >= 2:
+                    for i in range(n_parts - 1):
+                        masked_var = self._build_masked_string(parts, i, i + 2, 2, style, mask_token, target_name)
+                        variations.append(
+                            {'expand_mode': 'sub', 'start': i, 'end': i + 2, 'num_masks': 2, 'masked_str': masked_var})
 
-        cropped_codes = [prefix_str + v['masked_str'] + suffix_str for v in variations]
-        batch_logits, batch_mask_indices = self._get_model_logits_batched(cropped_codes)
+            for var in variations:
+                cropped_code = prefix_str + var['masked_str'] + suffix_str
+                mlm_tracking.append({
+                    "task_idx": task_idx,
+                    "cropped_code": cropped_code,
+                    "variation_info": var
+                })
 
+            # ---------------- 收集 LLM 任务 ----------------
+            # 因为传进来的代码已经是外部切片好的，直接用整个 code_bytes 作为 context
+            prompt = self._build_llm_prompt(
+                context_code=code_str,  # 使用切片后的短代码
+                target_name=target_name,
+                style=original_style,
+                top_n=top_n_keep * 4,
+                entity_type=entity_type,
+                n_parts=n_parts
+            )
+            llm_prompts.append(prompt)
+            llm_task_mapping.append(task_idx)
+
+        if not task_metadata:
+            return results  # 没有合法的变量被解析出
+
+        # =========================================================
+        # Phase 2: 集中发车 (GPU 并行推理)
+        # =========================================================
+        # 1. 批量处理 MLM
+        all_cropped_codes = [item["cropped_code"] for item in mlm_tracking]
+        batch_logits = None
+        batch_mask_indices = None
+        if all_cropped_codes:
+            # 假设你的 _get_model_logits_batched 能够处理较大的列表，或者内部有分批逻辑
+            batch_logits, batch_mask_indices = self._get_model_logits_batched(all_cropped_codes)
+
+        # 2. 批量处理 LLM (调用我们优化的 batch_chat)
+        llm_responses = []
+        if llm_prompts:
+            try:
+                llm_responses = self.llm_client.batch_chat(llm_prompts)
+            except Exception as e:
+                print(f"[!] LLM Batch Chat Failed: {e}")
+                llm_responses = [""] * len(llm_prompts)
+
+        # =========================================================
+        # Phase 3: 结果分发与解析
+        # =========================================================
+        def _join_parts(new_parts, orig_name, st):
+            if st == '_':
+                return "_".join(new_parts)
+            elif st == 'camel':
+                return "".join(
+                    p.lower() if j == 0 and orig_name[0].islower() else p.capitalize() for j, p in enumerate(new_parts))
+            return "".join(new_parts)
+
+        # 1. 分发 MLM 结果
         if batch_logits is not None:
-            for i, var in enumerate(variations):
+            for i, track_info in enumerate(mlm_tracking):
+                t_idx = track_info["task_idx"]
+                var_info = track_info["variation_info"]
+                meta = task_metadata[t_idx]
+
                 logits = batch_logits[i:i + 1]
                 mask_indices = batch_mask_indices[i]
-                expand_mode = var.get('expand_mode', 'none')
-                num_masks = var.get('num_masks', 1)
+                expand_mode = var_info.get('expand_mode', 'none')
+                num_masks = var_info.get('num_masks', 1)
 
                 if len(mask_indices) < num_masks: continue
 
@@ -590,133 +661,95 @@ Now, generate the JSON array for {target_name}:"""
                     words = self._decode_words(logits[0, mask_indices[0], :], top_k_mlm, allow_underscore=False)
                     for w in words:
                         if expand_mode == 'prefix':
-                            raw_mlm_cands.append(f"{w}_{target_name}")
+                            meta["raw_mlm_cands"].append(f"{w}_{meta['target_name']}")
                         elif expand_mode == 'suffix':
-                            raw_mlm_cands.append(f"{target_name}_{w}")
+                            meta["raw_mlm_cands"].append(f"{meta['target_name']}_{w}")
                         else:
-                            if n_parts == 1:
-                                raw_mlm_cands.append(w)
+                            if meta["n_parts"] == 1:
+                                meta["raw_mlm_cands"].append(w)
                             else:
-                                new_parts = parts[:var['start']] + [w] + parts[var['end']:]
-                                raw_mlm_cands.append(_join_parts(new_parts))
+                                new_parts = meta["parts"][:var_info['start']] + [w] + meta["parts"][var_info['end']:]
+                                meta["raw_mlm_cands"].append(_join_parts(new_parts, meta["target_name"], meta["style"]))
 
                 elif num_masks == 2:
-                    # 对于 2 个洞，使用极小的 top_k (如 4) 进行组合，4x4=16，防止组合爆炸
                     top_k_2holes = min(4, max(2, top_k_mlm // 4))
                     words1 = self._decode_words(logits[0, mask_indices[0], :], top_k_2holes, allow_underscore=False)
                     words2 = self._decode_words(logits[0, mask_indices[1], :], top_k_2holes, allow_underscore=False)
 
                     for w1, w2 in itertools.product(words1, words2):
-                        new_parts = parts[:var['start']] + [w1, w2] + parts[var['end']:]
-                        raw_mlm_cands.append(_join_parts(new_parts))
+                        new_parts = meta["parts"][:var_info['start']] + [w1, w2] + meta["parts"][var_info['end']:]
+                        meta["raw_mlm_cands"].append(_join_parts(new_parts, meta["target_name"], meta["style"]))
+
+        # 2. 分发 LLM 结果
+        for resp_idx, response in enumerate(llm_responses):
+            t_idx = llm_task_mapping[resp_idx]
+            meta = task_metadata[t_idx]
+
+            try:
+                json_match = re.search(r'\[(.*?)\]', response, re.DOTALL)
+                parsed_cands = json.loads(f"[{json_match.group(1)}]") if json_match else json.loads(response)
+            except Exception:
+                parsed_cands = re.findall(r'"([a-zA-Z0-9_]+)"', response)
+
+            for c in parsed_cands:
+                if isinstance(c, str) and c.strip():
+                    clean_cand = c.strip()
+                    cand_parts_list, _ = self._split_identifier(clean_cand)
+
+                    if meta["n_parts"] <= 2:
+                        if len(cand_parts_list) > (meta["n_parts"] + 1): continue
+                    else:
+                        if len(cand_parts_list) > (meta["n_parts"] + 2): continue
+
+                    meta["raw_llm_cands"].append(clean_cand)
 
         # =========================================================
-        # 引擎 B：LLM 全局语义重构 (覆盖所有变量长度)
+        # Phase 4: 独立应用配额漏斗 (过滤与组装)
         # =========================================================
-        start_idx = max(0, target_info['start'] - 400)
-        end_idx = min(len(code_bytes), target_info['end'] + 400)
-        context_block = code_bytes[start_idx:end_idx].decode("utf-8", errors="replace")
+        for t_idx, meta in task_metadata.items():
+            unique_llm_cands = list(dict.fromkeys(meta["raw_llm_cands"]))
+            unique_mlm_cands = list(dict.fromkeys(meta["raw_mlm_cands"]))
 
-        prompt = self._build_llm_prompt(
-            context_code=context_block,
-            target_name=target_name,
-            style=original_style,
-            top_n=top_n_keep * 2,
-            entity_type=entity_type,
-            n_parts=n_parts  # <--- 将 n_parts 传给 Prompt 用于动态字数限制
-        )
-        try:
-            llm_response = self.llm_client.chat(prompt)
-            json_match = re.search(r'\[(.*?)\]', llm_response, re.DOTALL)
-            llm_cands_parsed = json.loads(f"[{json_match.group(1)}]") if json_match else json.loads(llm_response)
-        except Exception as e:
-            llm_cands_parsed = re.findall(r'"([a-zA-Z0-9_]+)"', llm_response if 'llm_response' in locals() else "")
+            quota_llm = max(1, int(top_n_keep * 0.40))
+            quota_mlm = top_n_keep - quota_llm
 
-        for c in llm_cands_parsed:
-            if isinstance(c, str) and c.strip():
-                clean_cand = c.strip()
+            base_thresh = self.config.get('semantic_threshold', 0.85)
+            current_base_thresh = max(0.75, base_thresh - 0.05) if meta["n_parts"] > 1 else base_thresh
 
-                cand_parts_list, _ = self._split_identifier(clean_cand)
+            all_usages = meta["identifiers"][meta["target_name"]]
+            found_return_type = next((u['return_type'] for u in all_usages if u.get('return_type')), None)
 
-                if n_parts <= 2:
-                    if len(cand_parts_list) > (n_parts + 1):
-                        # print(f"[拦截] LLM 不听话，生成了超长词汇: {clean_cand}")
-                        continue
-                else:
-                    # 对于长变量，防止它无限膨胀 (比如限制最多比原词多 2 个 part)
-                    if len(cand_parts_list) > (n_parts + 2):
-                        continue
-                # ====================================================
+            ctx = {
+                'code_bytes': meta["code_bytes"],
+                'target_name': meta["target_name"],
+                'identifiers': meta["identifiers"],
+                'keywords': self.analyzer.keywords,
+                'original_style': meta["original_style"],
+                'local_prefix': meta["local_prefix"],
+                'local_suffix': meta["local_suffix"],
+                'semantic_threshold': current_base_thresh,
+                'preserve_style': self.config.get('preserve_style', True),
+                'entity_type': meta["entity_type"],
+                'return_type': found_return_type
+            }
 
-                raw_llm_cands.append(clean_cand)
+            final_candidates = []
 
-        # =========================================================
-        # 统一去重与 4:6 配额过滤漏斗
-        # =========================================================
-        unique_llm_cands = list(dict.fromkeys(raw_llm_cands))
-        unique_mlm_cands = list(dict.fromkeys(raw_mlm_cands))
+            self._verify_and_filter(unique_llm_cands, quota_llm, final_candidates, ctx, is_full_context=True,
+                                    generator_source='LLM')
 
-        # 计算配额：40% 给 LLM, 60% 给 MLM
-        quota_llm = max(1, int(top_n_keep * 0.40))
-        quota_mlm = top_n_keep - quota_llm
+            mlm_actual_quota = top_n_keep - len(final_candidates)
+            self._verify_and_filter(unique_mlm_cands, mlm_actual_quota, final_candidates, ctx, is_full_context=True,
+                                    generator_source='MLM')
 
-        # 动态基准线
-        base_thresh = self.config.get('semantic_threshold', 0.85)
-        current_base_thresh = max(0.75, base_thresh - 0.05) if n_parts > 1 else base_thresh
+            if len(final_candidates) < top_n_keep:
+                remaining_llm = [c for c in unique_llm_cands if c not in final_candidates]
+                self._verify_and_filter(remaining_llm, top_n_keep - len(final_candidates), final_candidates, ctx,
+                                        is_full_context=True, generator_source='LLM')
 
-        all_usages = identifiers[target_name]
-        found_return_type = next((u['return_type'] for u in all_usages if u.get('return_type')), None)
+            results[meta["target_name"]] = final_candidates
 
-        ctx = {
-            'code_bytes': code_bytes,
-            'target_name': target_name,
-            'identifiers': identifiers,
-            'keywords': self.analyzer.keywords,
-            'original_style': original_style,
-            'local_prefix': local_prefix,
-            'local_suffix': local_suffix,
-            'semantic_threshold': current_base_thresh,
-            'preserve_style': self.config.get('preserve_style', True),
-            'entity_type': entity_type,
-            'return_type': found_return_type
-        }
-
-        final_candidates = []
-
-        # 1. 优先结算 LLM 配额 (最高 40%)
-        llm_added = self._verify_and_filter(
-            candidate_list=unique_llm_cands,
-            quota=quota_llm,
-            final_candidates=final_candidates,
-            ctx=ctx,
-            is_full_context=True,
-            generator_source='LLM'  # <--- 明确注入 LLM 源
-        )
-
-        # 2. 结算 MLM 配额 (60% + 填补 LLM 未完成的配额)
-        mlm_actual_quota = top_n_keep - len(final_candidates)
-        self._verify_and_filter(
-            candidate_list=unique_mlm_cands,
-            quota=mlm_actual_quota,
-            final_candidates=final_candidates,
-            ctx=ctx,
-            is_full_context=True,
-            generator_source='MLM'  # <--- 明确注入 MLM 源
-        )
-
-        # 3. 后备兜底
-        if len(final_candidates) < top_n_keep:
-            remaining_llm = [c for c in unique_llm_cands if c not in final_candidates]
-            self._verify_and_filter(
-                candidate_list=remaining_llm,
-                quota=top_n_keep - len(final_candidates),
-                final_candidates=final_candidates,
-                ctx=ctx,
-                is_full_context=True,
-                generator_source='LLM'  # <--- 兜底的也是 LLM
-            )
-
-        return final_candidates
+        return results
 
     # def generate_candidates(self, code: str, target_name: str, identifiers=None) -> List[str]:
     #     """Performs standard context-aware candidate generation."""

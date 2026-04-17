@@ -1,5 +1,5 @@
 import argparse
-import gc
+import math
 import os
 import random
 
@@ -82,61 +82,100 @@ def main(args, config):
         return [name for name in data.keys() if name != "main"]
 
     import time
+    import gc
+    import torch
 
     def get_subs_pool_fn(code_str: str, variables: list) -> dict:
-        """Generates a pool of structural candidates for the specified variables."""
-        pool = {}
+        """Generates a pool of structural candidates using chunked batch processing to prevent OOM."""
         code_bytes = code_str.encode("utf-8")
 
-        # 提取完整代码的标识符
-        identifiers = analyzer.extract_identifiers(code_bytes)
+        # 🌟 新增：安全批处理大小，针对 8GB 显存建议设为 3 或 4
+        # 你可以根据实际显存占用率动态调高或调低
+        MAX_BATCH_SIZE = 4
 
-        # 1. 自动寻找最外部的函数名
+        # 1. 提取完整代码的标识符，寻找最外部的函数名
+        identifiers = analyzer.extract_identifiers(code_bytes)
         outermost_func_name = None
+
         for name, occurrences in identifiers.items():
             for occ in occurrences:
-                # 基于你的 AST 解析逻辑，最外层函数的 scope ID 为 0 且类型为 function
                 if occ["entity_type"] == "function" and occ["scope"] == 0:
                     outermost_func_name = name
                     break
             if outermost_func_name:
                 break
 
+        # 2. Phase 1: 收集所有变量的上下文切片
+        batch_tasks = []
+        print(f"[*] Slicing context for {len(variables)} variables...")
+
         for var in variables:
             try:
-                # 记录开始时间
-                start_time = time.perf_counter()
-
-                # 2. 判断是否是最外部函数名
                 if var == outermost_func_name:
-                    # 是最外部函数：使用完整代码，并可以安全复用之前的 identifiers
                     target_code_str = code_str
                 else:
-                    # 局部变量/内部结构：调用折叠方法获取切片代码
                     target_code_str = analyzer.get_folded_code(code_bytes, var)
 
-                # 调用双引擎候选词生成逻辑
-                pool[var] = generator.generate_candidates(
-                    target_code_str, var
+                batch_tasks.append({
+                    "target_name": var,
+                    "code_str": target_code_str
+                })
+            except Exception as e:
+                print(f"[Warning] Failed to slice code for {var}: {e}")
+
+        # 兜底初始化所有变量，确保不会报 KeyError
+        final_pool = {var: [] for var in variables}
+
+        if not batch_tasks:
+            return final_pool
+
+        # 3. Phase 2: 分块进行批量模型推理 (Chunked Batch Generation)
+        total_tasks = len(batch_tasks)
+        num_chunks = math.ceil(total_tasks / MAX_BATCH_SIZE)
+
+        print(
+            f"[*] Starting GPU generation for {total_tasks} tasks across {num_chunks} chunks (Max {MAX_BATCH_SIZE}/chunk)...")
+        start_time = time.perf_counter()
+
+        for i in range(0, total_tasks, MAX_BATCH_SIZE):
+            chunk = batch_tasks[i:i + MAX_BATCH_SIZE]
+            current_chunk_idx = (i // MAX_BATCH_SIZE) + 1
+            print(f"  -> Processing chunk {current_chunk_idx}/{num_chunks} (size: {len(chunk)})...")
+
+            try:
+                # 将切分好的 chunk 送入生成器
+                chunk_pool = generator.generate_candidates(
+                    batch_tasks=chunk,
+                    top_k_mlm=40,
+                    top_n_keep=50
                 )
-
-                # 记录结束时间并计算差值
-                end_time = time.perf_counter()
-                elapsed_time = end_time - start_time
-
-                # 打印耗时和生成的候选词数量
-                print(
-                    f"[Info] Successfully generated {len(pool[var])} candidates for '{var}' in {elapsed_time:.4f} seconds.")
+                # 将当前块的结果合并到最终的池子中
+                final_pool.update(chunk_pool)
 
             except Exception as e:
-                print(f"[Warning] Failed to generate for {var}: {e}")
-                pool[var] = []
+                print(f"[Error] Chunk {current_chunk_idx} failed catastrophically: {e}")
+                # 如果当前 chunk 爆显存了，程序不会崩溃，只会损失这几个变量的候选词
 
             finally:
-                gc.collect()
-                torch.cuda.empty_cache()
+                if 'chunk_pool' in locals():
+                    del chunk_pool
 
-        return pool
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+
+        # 4. 统计打印
+        for var in variables:
+            cands = final_pool.get(var, [])
+            print(f"    - Generated {len(cands)} candidates for '{var}'")
+
+        print(
+            f"[*] All {num_chunks} chunks completed in {elapsed_time:.4f} seconds (Avg: {elapsed_time / max(1, total_tasks):.4f}s per variable).")
+
+        return final_pool
 
     def rename_fn(code_str: str, renaming_map: dict) -> str:
         """Applies variable renaming using the code transformer."""
