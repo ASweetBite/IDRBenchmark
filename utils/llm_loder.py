@@ -46,7 +46,7 @@ class LocalLLMClient:
 
         outputs = self.model.generate(
             **inputs,
-            max_new_tokens=50,
+            max_new_tokens=256,
             temperature=0.6,
             top_p=0.9,
             do_sample=True,
@@ -77,9 +77,10 @@ class LocalLLMClient:
 
         outputs = self.model.generate(
             **inputs,
-            max_new_tokens=50,
-            temperature=0.6,
-            top_p=0.9,
+            max_new_tokens=256,
+            temperature=0.85,
+            top_p=0.95,
+            # repetition_penalty=1.15,
             do_sample=True,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id

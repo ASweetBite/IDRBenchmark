@@ -3,7 +3,7 @@ import json
 import random
 import re
 from collections import defaultdict
-from typing import List, Dict, Any
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -383,7 +383,7 @@ class HeavyWeightCandidateGenerator:
                             else:
                                 current_threshold = min(0.99, base_threshold + 0.13)
                         elif len(target_parts) == 1:
-                            current_threshold = base_threshold + 0.02
+                            current_threshold = base_threshold
 
                     else:
                         # Fallback (兜底原本的逻辑)
@@ -461,30 +461,31 @@ class HeavyWeightCandidateGenerator:
 
     def _build_llm_prompt(self, context_code: str, target_name: str, style: str, top_n: int, entity_type: str, n_parts: int) -> str:
         """
-        统一的 LLM 提示词构建器：通过 n_parts 动态切换短变量微调与长变量重构策略。
+        统一的 LLM 提示词构建器：针对 1.5B 小模型优化。
         """
-        # ================= 1. 实体词性约束 =================
+        # ================= 1. 实体词性约束 (简化语言，小模型更容易懂) =================
         if entity_type == 'VARIABLE':
-            entity_rule = "NO ACTION VERBS: This is a data VARIABLE. DO NOT use verb phrases like 'allocate_'. Use NOUN phrases only (e.g., 'shared_memory_region')."
+            entity_rule = "Use NOUNS only (e.g., 'data_buffer'). NO verbs."
         elif entity_type == 'BOOLEAN_VAR':
-            entity_rule = "BOOLEAN STYLE: Use prefixes like 'is_', 'has_' or state nouns."
+            entity_rule = "Use BOOLEAN prefixes (e.g., 'is_', 'has_', 'can_')."
         else:
-            entity_rule = "FUNCTION STYLE: This is a FUNCTION. Action verbs are required."
+            entity_rule = "Use ACTION VERBS (e.g., 'get_data', 'update_state')."
 
+        # ================= 2. 策略约束 (降低认知负担) =================
         if n_parts <= 2:
             max_allowed_parts = n_parts + 1
-            strategy_instruction = f"""[Strategy: Concise Tweaks]
-1. STRICT LENGTH LIMIT: The original name `{target_name}` has {n_parts} word(s). Your generated names MUST contain NO MORE THAN {max_allowed_parts} word(s) in total. 
-   - Example of ALLOWED (≤{max_allowed_parts} words): "shm_info", "mem_data"
-   - Example of FORBIDDEN (>{max_allowed_parts} words): "shared_memory_info", "shared_memory_data_block"
-2. ABBREVIATIONS & SYNONYMS: Prefer idiomatic C/C++ abbreviations (e.g., 'ptr', 'buf', 'mem', 'idx', 'val', 'shm') or extremely short synonyms. Do not over-describe."""
+            strategy_instruction = f"""[Strategy: Short & Concise]
+- MAX WORDS: {max_allowed_parts} words per name.
+- EXAMPLES: "shm_info", "mem_data", "idx"
+- Use common C/C++ abbreviations (ptr, buf, mem, val)."""
         else:
             strategy_instruction = f"""[Strategy: Semantic Refactoring]
-1. PROFESSIONAL SYNONYMS: Use precise terminology that fits the exact system logic but alters the specific words used.
-2. LIMIT LENGTH: The new name must NOT be drastically longer than the original `{target_name}`."""
+- Provide professional synonyms matching the exact system logic.
+- Keep the length similar to the original name."""
 
-        # ================= 3. 组装最终 Prompt =================
-        return f"""You are an expert Linux/C/C++ kernel developer. Analyze the snippet and suggest exactly {top_n} alternative names for `{target_name}`.
+        # ================= 3. 组装最终 Prompt (修复代码块，增加示例与引导) =================
+        # 注意：在末尾直接输出 ```json\n[ ，这叫做 Output Priming，能强制小模型开始写数组。
+        return f"""You are an expert C/C++ developer. Suggest exactly {top_n} alternative names for `{target_name}`.
 
 [Context Code]
 ```cpp
@@ -495,16 +496,21 @@ class HeavyWeightCandidateGenerator:
 
 {entity_rule}
 
-STYLE MATCH: Strictly use the {style} naming convention.
+STYLE: Use {style} naming convention.
 
-NO PLACEHOLDERS: Never use generic names like "new_variable_1", "var_a", or "temp".
+NO generic names ("new_var", "temp").
 
-FORMAT: Output ONLY a JSON array of strings. Do not explain.
+[Task]
+Output ONLY a JSON array containing EXACTLY {top_n} strings. Do not explain.
+Example format for {top_n} items: ["name1", "name2", "name3", ...]
 
-Now, generate the JSON array for {target_name}:"""
+JSON
+["""
 
-    def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 50) -> \
-    Dict[str, List[str]]:
+    from typing import List, Dict, Any
+
+    def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 50) -> Dict[
+        str, List[str]]:
         """
         批量候选词生成架构：极大提升 GPU 并行利用率
         :param batch_tasks: 列表，每个元素形如 {"target_name": "var_name", "code_str": "sliced_context"}
@@ -512,17 +518,15 @@ Now, generate the JSON array for {target_name}:"""
         """
         results = {task["target_name"]: [] for task in batch_tasks}
 
-        # 用于记录和分发批处理结果的追踪器
-        mlm_tracking = []  # 记录所有展平的 MLM 变体
-        llm_prompts = []  # 记录所有 LLM Prompt
-        llm_task_mapping = []  # 记录 prompt 对应哪个 task 的索引
-
-        task_metadata = {}  # 存储每个 task 的解析状态 (parts, style, prefix, suffix 等)
+        mlm_tracking = []
+        llm_prompts = []
+        llm_task_mapping = []
+        task_metadata = {}
 
         mask_token = self.mlm_engine.tokenizer.mask_token
 
         # =========================================================
-        # Phase 1: 请求收集与预处理 (CPU 计算，极快)
+        # Phase 1: 请求收集与预处理
         # =========================================================
         for task_idx, task in enumerate(batch_tasks):
             target_name = task["target_name"]
@@ -536,7 +540,6 @@ Now, generate the JSON array for {target_name}:"""
             best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
             target_info = identifiers[target_name][best_occ_idx]
 
-            # 实体类型判定
             raw_entity_type = target_info.get('entity_type', 'variable')
             entity_type = 'FUNCTION' if raw_entity_type == 'function' else 'VARIABLE'
             if entity_type == 'VARIABLE' and target_name.startswith(('is_', 'has_', 'can_', 'should_')):
@@ -549,7 +552,6 @@ Now, generate the JSON array for {target_name}:"""
             local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, target_info['start'],
                                                                          target_info['end'])
 
-            # 记录 Metadata 供后续组装和过滤使用
             task_metadata[task_idx] = {
                 "target_name": target_name,
                 "parts": parts,
@@ -597,12 +599,11 @@ Now, generate the JSON array for {target_name}:"""
                 })
 
             # ---------------- 收集 LLM 任务 ----------------
-            # 因为传进来的代码已经是外部切片好的，直接用整个 code_bytes 作为 context
             prompt = self._build_llm_prompt(
-                context_code=code_str,  # 使用切片后的短代码
+                context_code=code_str,
                 target_name=target_name,
                 style=original_style,
-                top_n=top_n_keep * 4,
+                top_n=int(top_n_keep * 1.5),
                 entity_type=entity_type,
                 n_parts=n_parts
             )
@@ -610,20 +611,17 @@ Now, generate the JSON array for {target_name}:"""
             llm_task_mapping.append(task_idx)
 
         if not task_metadata:
-            return results  # 没有合法的变量被解析出
+            return results
 
         # =========================================================
-        # Phase 2: 集中发车 (GPU 并行推理)
+        # Phase 2: GPU 并行推理
         # =========================================================
-        # 1. 批量处理 MLM
         all_cropped_codes = [item["cropped_code"] for item in mlm_tracking]
         batch_logits = None
         batch_mask_indices = None
         if all_cropped_codes:
-            # 假设你的 _get_model_logits_batched 能够处理较大的列表，或者内部有分批逻辑
             batch_logits, batch_mask_indices = self._get_model_logits_batched(all_cropped_codes)
 
-        # 2. 批量处理 LLM (调用我们优化的 batch_chat)
         llm_responses = []
         if llm_prompts:
             try:
@@ -685,26 +683,81 @@ Now, generate the JSON array for {target_name}:"""
             t_idx = llm_task_mapping[resp_idx]
             meta = task_metadata[t_idx]
 
-            try:
-                json_match = re.search(r'\[(.*?)\]', response, re.DOTALL)
-                parsed_cands = json.loads(f"[{json_match.group(1)}]") if json_match else json.loads(response)
-            except Exception:
-                parsed_cands = re.findall(r'"([a-zA-Z0-9_]+)"', response)
+            parsed_cands = []
+            if response and isinstance(response, str):
+                # 1. 剔除常见的 Markdown 干扰代码块
+                clean_text = response.replace("```json", "").replace("```", "").strip()
+
+                # 2. 智能截取与补全：寻找第一个和最后一个引号
+                first_quote = clean_text.find('"')
+                last_quote = clean_text.rfind('"')
+
+                # 确保找到了至少一对引号
+                if first_quote != -1 and last_quote != -1 and first_quote != last_quote:
+                    # 提取核心部分，例如截取出的结果是: "name1", "name2"
+                    core_text = clean_text[first_quote:last_quote + 1]
+                    # 强行包裹为标准 JSON 数组
+                    patched_json = f"[{core_text}]"
+
+                    try:
+                        parsed_cands = json.loads(patched_json)
+                        if not isinstance(parsed_cands, list):
+                            parsed_cands = [str(parsed_cands)]
+                    except Exception:
+                        pass  # 解析失败则静默进入兜底逻辑
+
+                # 3. 终极兜底策略：如果上面的 JSON 解析依然失败（或者根本没双引号），直接用正则硬抠
+                if not parsed_cands:
+                    # 兼容单双引号包裹的，且符合 C/C++ 标识符规范的字符串
+                    parsed_cands = re.findall(r'["\']([a-zA-Z0-9_]+)["\']', response)
+
+            min_threshold = int(top_n_keep * 0.4)
+
+            # print(f"LLM 原始生成结果 (Target: {meta['target_name']}):")
+
+            # 双桶分流：严格符合长度的放 valid_cands，超长的放 oversized_cands
+            valid_cands = []
+            oversized_cands = []
 
             for c in parsed_cands:
                 if isinstance(c, str) and c.strip():
                     clean_cand = c.strip()
+                    # 假设你之前有个去重逻辑，防止模型输出重复的词
+                    if clean_cand in valid_cands or clean_cand in oversized_cands:
+                        continue
+
                     cand_parts_list, _ = self._split_identifier(clean_cand)
 
+                    # 判断长度是否合法
                     if meta["n_parts"] <= 2:
-                        if len(cand_parts_list) > (meta["n_parts"] + 1): continue
+                        is_valid_length = len(cand_parts_list) <= (meta["n_parts"] + 1)
                     else:
-                        if len(cand_parts_list) > (meta["n_parts"] + 2): continue
+                        is_valid_length = len(cand_parts_list) <= (meta["n_parts"] + 2)
 
-                    meta["raw_llm_cands"].append(clean_cand)
+                    if is_valid_length:
+                        valid_cands.append(clean_cand)
+                    else:
+                        oversized_cands.append(clean_cand)
 
+            # 核心折中方案：检查合格数量是否达标
+            if len(valid_cands) < min_threshold and oversized_cands:
+                shortfall = min_threshold - len(valid_cands)
+                # print(f"  ⚠️ 警告: 合格候选词数量 ({len(valid_cands)}) 低于最低阈值 ({min_threshold})。")
+                # print(f"  🔄 正在从超长备用列表中捞取最多 {shortfall} 个候选词...")
+
+                # 将超长的部分补充进有效列表，直到满足阈值（或者备用桶被掏空）
+                fallback_cands = oversized_cands[:shortfall]
+                valid_cands.extend(fallback_cands)
+
+                for fc in fallback_cands:
+                    # print(f"    -> 已打捞备用词: {fc}")
+                    pass
+
+            # 将最终存活的候选词存入 meta
+            meta["raw_llm_cands"].extend(valid_cands)
+            # print(f"  🎯 最终入库候选词数量: {len(valid_cands)}")
         # =========================================================
-        # Phase 4: 独立应用配额漏斗 (过滤与组装)
+        # Phase 4: 应用配额漏斗过滤
         # =========================================================
         for t_idx, meta in task_metadata.items():
             unique_llm_cands = list(dict.fromkeys(meta["raw_llm_cands"]))

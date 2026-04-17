@@ -3,8 +3,12 @@ import re
 import yaml
 import torch
 import torch.nn.functional as F
+import gc
+import time
+import math
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
+# 保持原有导入不变
 from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer
 from utils.llm_loder import LocalLLMClient
@@ -12,24 +16,23 @@ from utils.mlm_engine import MLMEngine
 from utils.miner import NamingDataMiner
 
 
-def evaluate_and_print_candidates(generator, code_str: str, target_name: str):
+def evaluate_and_print_candidates(generator, full_code_bytes: bytes, target_name: str, candidates: list):
     """
-    调用最新版生成器获取候选词，并重构计算过程，打印 Token 级相似度与 NLP 修正分。
+    重构后的评估函数：直接接收 candidates 列表，计算相似度并打印。
     """
-    print(f"\n[*] 开始为变量 '{target_name}' 生成候选词 (LLM + MLM Filter)...")
-
-    # 1. 调用最新的生成方法
-    candidates = generator.generate_candidates(code_str, target_name)
+    print(f"\n[*] 正在评估变量 '{target_name}' 的候选词 (共 {len(candidates)} 个)...")
 
     if not candidates:
         print(f"[-] 未能为 '{target_name}' 生成任何有效且合法的候选词。")
         return
 
-    # 2. 提取数据计算排版分数
-    code_bytes = code_str.encode('utf-8')
-    identifiers = generator.analyzer.extract_identifiers(code_bytes)
+    # 1. 提取数据计算排版分数
+    identifiers = generator.analyzer.extract_identifiers(full_code_bytes)
+    if target_name not in identifiers:
+        print(f"[-] 错误: '{target_name}' 在 AST 解析中丢失。")
+        return
 
-    best_occ_idx = generator._find_best_context_occurrence(code_bytes, identifiers[target_name])
+    best_occ_idx = generator._find_best_context_occurrence(full_code_bytes, identifiers[target_name])
     target_info = identifiers[target_name][best_occ_idx]
 
     raw_entity_type = target_info.get('entity_type', 'variable')
@@ -38,7 +41,7 @@ def evaluate_and_print_candidates(generator, code_str: str, target_name: str):
         entity_type = 'BOOLEAN_VAR'
 
     local_prefix, local_suffix = generator._extract_local_context_ast(
-        code_bytes, target_info['start'], target_info['end']
+        full_code_bytes, target_info['start'], target_info['end']
     )
 
     orig_emb = generator._get_variable_token_embeddings(
@@ -80,25 +83,6 @@ def evaluate_and_print_candidates(generator, code_str: str, target_name: str):
     print("-" * 85)
 
 
-import os
-import re
-import yaml
-import torch
-import torch.nn.functional as F
-import gc
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-
-# 保持原有导入不变
-from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
-from utils.ast_tools import IdentifierAnalyzer
-from utils.mlm_engine import MLMEngine
-from utils.miner import NamingDataMiner
-
-
-# ... [LocalLLMClient 类保持不变] ...
-
-# ... [evaluate_and_print_candidates 函数保持不变] ...
-
 def main():
     try:
         with open("config/config.yaml", 'r', encoding='utf-8') as f:
@@ -130,13 +114,16 @@ def main():
         config=config['heavyweight_candidate']
     )
 
+    # 🌟 防 OOM 分块批处理大小设置
+    MAX_BATCH_SIZE = 4
+
     # 2. 进入交互主循环
     while True:
-        print("\n" + "=" * 50)
+        print("\n" + "=" * 60)
         print("📥 请输入/粘贴 C/C++ 函数代码")
         print("💡 结束代码输入：新起一行输入 'END'")
         print("🚪 退出程序：输入 'OUT'")
-        print("=" * 50)
+        print("=" * 60)
 
         lines = []
         is_exit = False
@@ -168,32 +155,80 @@ def main():
             print("[!] 未能从代码中提取到有效标识符。")
             continue
 
-        # 4. 选择目标变量
-        target_var = max(identifiers.keys(), key=lambda k: len(identifiers[k]))
-        print(f"\n当前代码提取到 {len(identifiers)} 个标识符。")
-        print(f"自动选择高频变量: '{target_var}'")
+        print(f"\n[*] 当前代码共提取到 {len(identifiers)} 个标识符: ")
+        print(", ".join(identifiers.keys()))
 
-        user_input = input(f"请输入要测试的变量名 (直接回车使用 '{target_var}', 输入 'BACK' 返回代码输入): ").strip()
+        # 4. 选择目标变量
+        user_input = input(
+            "\n请输入要测试的变量名 (多个变量用空格分隔, 输入 'ALL' 测试全部, 输入 'BACK' 返回): ").strip()
 
         if user_input.upper() == "BACK":
             continue
-        if user_input:
-            if user_input not in identifiers:
-                print(f"[-] 错误：变量 '{user_input}' 不在提取列表中。")
-                continue
-            target_var = user_input
 
-        # 5. 执行评估
-        sliced_code = source_code_str
-        if hasattr(analyzer, 'get_folded_code'):
-            sliced_code = analyzer.get_folded_code(code_bytes, target_var)
+        target_vars = []
+        if user_input.upper() == "ALL":
+            target_vars = list(identifiers.keys())
+        else:
+            selected = user_input.split()
+            for v in selected:
+                if v in identifiers:
+                    target_vars.append(v)
+                else:
+                    print(f"[-] 警告：变量 '{v}' 不在提取列表中，已忽略。")
 
-        try:
-            evaluate_and_print_candidates(generator, sliced_code, target_var)
-        except Exception as e:
-            print(f"[!] 处理过程中发生错误: {e}")
+        if not target_vars:
+            print("[!] 未选择任何有效变量。")
+            continue
 
-        # 6. 显存与内存清理（循环运行必备，防止 OOM）
+        # 5. 组装批量任务 (代码切片)
+        batch_tasks = []
+        print(f"\n[*] 正在为 {len(target_vars)} 个变量执行代码切片 (Slicing)...")
+        for var in target_vars:
+            sliced_code = source_code_str
+            if hasattr(analyzer, 'get_folded_code'):
+                sliced_code = analyzer.get_folded_code(code_bytes, var)
+            batch_tasks.append({
+                "target_name": var,
+                "code_str": sliced_code
+            })
+
+        # 6. 分块批量生成 (防 OOM 核心逻辑)
+        total_tasks = len(batch_tasks)
+        num_chunks = math.ceil(total_tasks / MAX_BATCH_SIZE)
+
+        print(f"[*] 开始 GPU 并行生成，分为 {num_chunks} 个批次 (最大 {MAX_BATCH_SIZE} 任务/批次)...")
+        start_time = time.perf_counter()
+
+        all_results = {}
+        for i in range(0, total_tasks, MAX_BATCH_SIZE):
+            chunk = batch_tasks[i:i + MAX_BATCH_SIZE]
+            current_chunk_idx = (i // MAX_BATCH_SIZE) + 1
+            print(f"  -> 正在处理第 {current_chunk_idx}/{num_chunks} 批次...")
+
+            try:
+                chunk_pool = generator.generate_candidates(
+                    batch_tasks=chunk,
+                    top_k_mlm=40,
+                    top_n_keep=50
+                )
+                all_results.update(chunk_pool)
+            except Exception as e:
+                print(f"[!] 第 {current_chunk_idx} 批次处理失败: {e}")
+            finally:
+                if 'chunk_pool' in locals():
+                    del chunk_pool
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        elapsed_time = time.perf_counter() - start_time
+        print(f"[*] 批量生成完成！总耗时: {elapsed_time:.2f} 秒 (平均 {elapsed_time / total_tasks:.2f} 秒/变量)")
+
+        # 7. 评估并打印每一个变量的得分
+        for var_name, cands in all_results.items():
+            evaluate_and_print_candidates(generator, code_bytes, var_name, cands)
+
+        # 循环结束后的清理
         gc.collect()
         torch.cuda.empty_cache()
 
