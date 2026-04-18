@@ -14,7 +14,10 @@ class RNNS_Ranker:
     def rank_variables(self, code, variables, subs_pool, reference_label,
                        test_sample_size=10, top_k=10, filter_short_vars=True):
 
-        orig_prob = self.model_zoo.predict_label_conf(code, reference_label, self.target_model)
+        oref_idx = 0 if reference_label == -1 else reference_label
+
+        # 使用修正后的索引去获取概率
+        orig_prob = self.model_zoo.predict_label_conf(code, oref_idx, self.target_model)
 
         if filter_short_vars:
             valid_vars = [v for v in variables if len(v) > 2]
@@ -62,15 +65,17 @@ class RNNS_Ranker:
         all_probs, _ = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
 
         var_max_drop = {var: -float('inf') for var in valid_vars}
-        var_best_cand = {var: var for var in valid_vars}  # 用于记录每个变量导致概率下降最多的那个词
+        var_best_cand = {var: var for var in valid_vars}
 
         for (var, cand, _), probs in zip(mutation_tasks, all_probs):
-            new_prob = probs[reference_label]
+            # 🌟 修复点：这里也必须使用修正后的物理索引
+            new_prob = probs[oref_idx]
+
             prob_drop = orig_prob - new_prob
 
             if prob_drop > var_max_drop[var]:
                 var_max_drop[var] = prob_drop
-                var_best_cand[var] = cand  # 🌟 记录最佳单步替换词，传给 GA 做种子
+                var_best_cand[var] = cand
 
         valid_scores = [(var, score) for var, score in var_max_drop.items() if score != -float('inf')]
 

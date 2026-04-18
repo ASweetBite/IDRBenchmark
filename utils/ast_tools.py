@@ -371,19 +371,12 @@ class IdentifierAnalyzer:
             return code_bytes.decode("utf-8")
 
     def _get_enclosing_statement(self, node):
-        """
-        向上遍历 AST，寻找包含当前节点的完整语句（Statement）。
-        当父节点是作用域块或控制流语句头部时停止，当前节点即为最小完整语句级切片。
-        """
+        """向上遍历 AST，寻找包含当前节点的最小完整语句块"""
         curr = node
         stop_parent_types = {
-            'compound_statement',
-            'translation_unit',
-            'for_statement',
-            'while_statement',
-            'if_statement',
-            'switch_statement',
-            'function_definition'
+            'compound_statement', 'translation_unit', 'for_statement',
+            'while_statement', 'do_statement', 'if_statement',
+            'switch_statement', 'function_definition'
         }
 
         while curr.parent:
@@ -393,22 +386,20 @@ class IdentifierAnalyzer:
         return curr
 
     def get_folded_code(self, source_code: bytes, target_var: str) -> str:
-        """提取数据流切片，强制闭合所有分支，并完美保留无括号单行语句和所有函数调用"""
+        """提取数据流切片，强制闭合分支，向下提取控制流，并保留代表性语句"""
         from tree_sitter import Parser
         parser = Parser()
         parser.language = self.language
         tree = parser.parse(source_code)
 
         target_nodes = []
-        call_nodes = []
 
         def find_nodes(node):
             if node.type in ["identifier", "field_identifier"]:
                 name = source_code[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
                 if name == target_var:
                     target_nodes.append(node)
-            elif node.type == "call_expression":
-                call_nodes.append(node)
+            # 注意：这里已经去掉了无差别的 call_expression 收集，专心跟踪变量
             for child in node.children:
                 find_nodes(child)
 
@@ -416,85 +407,234 @@ class IdentifierAnalyzer:
         if not target_nodes:
             return source_code.decode("utf-8", errors="replace")
 
-        ranges_to_keep = []
-        insertions = []
+        full_nodes = {}
 
-        def handle_control_body(body_node):
-            if not body_node:
-                return
-            if body_node.type == 'compound_statement':
-                # 已有括号：仅保留 '{' 和 '}'
-                ranges_to_keep.append((body_node.start_byte, body_node.start_byte + 1))
-                ranges_to_keep.append((body_node.end_byte - 1, body_node.end_byte))
-            elif body_node.type != 'if_statement':
-                # 无括号的单行语句：强制注入 '{' 和 '}'，并将单行语句本身保留
-                insertions.append((body_node.start_byte, b" { "))
-                insertions.append((body_node.end_byte, b" } "))
-                ranges_to_keep.append((body_node.start_byte, body_node.end_byte))
+        # 1. 识别并收集核心目标语句
+        for node in target_nodes:
+            stmt = self._get_enclosing_statement(node)
+            if stmt and stmt.id not in full_nodes:
+                full_nodes[stmt.id] = stmt
 
-        # 使用基于祖先路径的追溯法，确保所有嵌套的控制流都能精准还原头部和闭合
-        for node in target_nodes + call_nodes:
-            curr = node
+        # 2. 提取完整定义 (Variable Hoisting)
+        func_defs = {}
+        for stmt in full_nodes.values():
+            curr = stmt
+            while curr and curr.type != 'function_definition':
+                curr = curr.parent
+            if curr and curr.id not in func_defs:
+                func_defs[curr.id] = curr
+
+        for func in func_defs.values():
+            body = func.child_by_field_name('body')
+            if body and body.type == 'compound_statement':
+                for child in body.children:
+                    if child.type == 'declaration':
+                        full_nodes[child.id] = child
+
+        # 3.1 标记所有核心节点的祖先路径（骨架 Skeleton）
+        skeleton_nodes = {}
+        for stmt in full_nodes.values():
+            curr = stmt.parent
             while curr:
-                if curr.type in ['expression_statement', 'declaration', 'return_statement',
-                                 'break_statement', 'continue_statement', 'goto_statement']:
-                    ranges_to_keep.append((curr.start_byte, curr.end_byte))
-
-                elif curr.type == 'if_statement':
-                    # 提取 if 头部
-                    cond_node = curr.child_by_field_name('condition')
-                    if cond_node:
-                        ranges_to_keep.append((curr.start_byte, cond_node.end_byte))
-                    else:
-                        ranges_to_keep.append((curr.start_byte, curr.start_byte + 2))
-
-                    handle_control_body(curr.child_by_field_name('consequence'))
-
-                    alt = curr.child_by_field_name('alternative')
-                    if alt:
-                        # 只有当前追踪的变量在 else 内部时，才保留 else 关键字
-                        if node.start_byte >= alt.start_byte and node.end_byte <= alt.end_byte:
-                            for child in curr.children:
-                                if child.type == 'else':
-                                    ranges_to_keep.append((child.start_byte, child.end_byte))
-                                    break
-                            handle_control_body(alt)
-
-                elif curr.type in ['while_statement', 'for_statement', 'switch_statement']:
-                    # 提取控制流头部（精准找寻右括号）
-                    cond_node = curr.child_by_field_name('condition')
-                    if cond_node:
-                        for child in curr.children:
-                            if child.type == ')' and child.start_byte >= cond_node.end_byte:
-                                ranges_to_keep.append((curr.start_byte, child.end_byte))
-                                break
-                        else:
-                            ranges_to_keep.append((curr.start_byte, cond_node.end_byte))
-                    else:
-                        body = curr.child_by_field_name('body')
-                        if body:
-                            for child in reversed(curr.children):
-                                if child.type == ')' and child.end_byte <= body.start_byte:
-                                    ranges_to_keep.append((curr.start_byte, child.end_byte))
-                                    break
-                            else:
-                                ranges_to_keep.append((curr.start_byte, body.start_byte))
-                        else:
-                            ranges_to_keep.append((curr.start_byte, curr.end_byte))
-
-                    handle_control_body(curr.child_by_field_name('body'))
-
-                elif curr.type == 'function_definition':
-                    body = curr.child_by_field_name('body')
-                    if body and body.type == 'compound_statement':
-                        ranges_to_keep.append((curr.start_byte, body.start_byte + 1))
-                        ranges_to_keep.append((body.end_byte - 1, body.end_byte))
-                    else:
-                        ranges_to_keep.append((curr.start_byte, curr.end_byte))
-
+                skeleton_nodes[curr.id] = curr
                 curr = curr.parent
 
-        # 区间去重与合并
+        # 3.2 语义扩展：向下的控制流传播 (Downward Control Flow Propagation)
+        CFG_SKELETON_TYPES = {
+            'if_statement', 'for_statement', 'while_statement', 'do_statement', 'switch_statement',
+            'compound_statement'
+        }
+        CFG_TERMINAL_TYPES = {
+            'goto_statement', 'return_statement', 'break_statement', 'continue_statement'
+        }
+
+        def contains_full_node(n):
+            if not n: return False
+            if n.id in full_nodes: return True
+            for c in n.children:
+                if contains_full_node(c): return True
+            return False
+
+        def propagate_control_flow(node):
+            if not node: return
+            is_target = False
+            if node.type in CFG_SKELETON_TYPES:
+                skeleton_nodes[node.id] = node
+                is_target = True
+            elif node.type in CFG_TERMINAL_TYPES:
+                full_nodes[node.id] = node
+                is_target = True
+
+            if is_target:
+                curr = node.parent
+                while curr and curr.id not in skeleton_nodes:
+                    skeleton_nodes[curr.id] = curr
+                    curr = curr.parent
+
+            for child in node.children:
+                propagate_control_flow(child)
+
+        for node in list(skeleton_nodes.values()):
+            if node.type in ['if_statement', 'while_statement', 'do_statement', 'switch_statement']:
+                cond = node.child_by_field_name('condition')
+                if contains_full_node(cond):
+                    if node.type == 'if_statement':
+                        propagate_control_flow(node.child_by_field_name('consequence'))
+                        propagate_control_flow(node.child_by_field_name('alternative'))
+                    elif node.type == 'do_statement':
+                        propagate_control_flow(node.child_by_field_name('body'))
+                    else:
+                        propagate_control_flow(node.child_by_field_name('body'))
+            elif node.type == 'for_statement':
+                init = node.child_by_field_name('initializer')
+                cond = node.child_by_field_name('condition')
+                upd = node.child_by_field_name('update')
+                if contains_full_node(init) or contains_full_node(cond) or contains_full_node(upd):
+                    propagate_control_flow(node.child_by_field_name('body'))
+
+        # 3.3 语法修补：单行控制流的边界防吞咽
+        def fix_control_flow(node):
+            if node.type in ['if_statement', 'for_statement', 'while_statement', 'do_statement']:
+                body = node.child_by_field_name(
+                    'consequence') if node.type == 'if_statement' else node.child_by_field_name('body')
+                if body:
+                    if body.type != 'compound_statement':
+                        if body.id not in full_nodes:
+                            full_nodes[body.id] = body
+                    else:
+                        if body.id not in skeleton_nodes:
+                            skeleton_nodes[body.id] = body
+                            fix_control_flow(body)
+
+                if node.type == 'if_statement':
+                    alt = node.child_by_field_name('alternative')
+                    if alt:
+                        if alt.id not in skeleton_nodes:
+                            skeleton_nodes[alt.id] = alt
+                        for child in alt.children:
+                            if child.is_named:
+                                if child.type not in ['compound_statement', 'if_statement']:
+                                    if child.id not in full_nodes:
+                                        full_nodes[child.id] = child
+                                else:
+                                    if child.id not in skeleton_nodes:
+                                        skeleton_nodes[child.id] = child
+                                        fix_control_flow(child)
+
+        for node in list(skeleton_nodes.values()):
+            fix_control_flow(node)
+
+        # 3.4 块级代表语句补全 (Ensure Block Representativeness)
+        # 找出所有被放入骨架的大括号块，按尺寸从内到外(短到长)排序，保证自底向上处理
+        comp_stmts = [node for node in skeleton_nodes.values() if node.type == 'compound_statement']
+        comp_stmts.sort(key=lambda n: n.end_byte - n.start_byte)
+
+        def has_full_node_inside(n):
+            if not n: return False
+            if n.id in full_nodes: return True
+            for c in n.children:
+                if has_full_node_inside(c): return True
+            return False
+
+        def contains_call(n):
+            if n.type == 'call_expression': return True
+            for c in n.children:
+                if contains_call(c): return True
+            return False
+
+        for comp_node in comp_stmts:
+            # 如果这个大括号块里面完全没有保留任何实体语句
+            if not has_full_node_inside(comp_node):
+                valid_stmts = [c for c in comp_node.children if c.is_named and c.type not in ('comment', 'ERROR')]
+                if valid_stmts:
+                    picked = None
+
+                    # 优先级 1：寻找包含函数调用的语句（最具代表性）
+                    for stmt in valid_stmts:
+                        if contains_call(stmt):
+                            picked = stmt
+                            break
+
+                    # 优先级 2：寻找基础语句，而非复杂的嵌套结构（避免整个嵌套树被不慎完全展开）
+                    if not picked:
+                        for stmt in valid_stmts:
+                            if stmt.type not in ['if_statement', 'for_statement', 'while_statement', 'do_statement',
+                                                 'switch_statement']:
+                                picked = stmt
+                                break
+
+                    # 优先级 3：如果没有别的选择，直接保留第一条可见语句
+                    if not picked:
+                        picked = valid_stmts[0]
+
+                    # 将选中的这条语句提升为核心保留节点
+                    full_nodes[picked.id] = picked
+
+        # 4. 递归遍历 AST，生成保留区间 (Visitor Pattern)
+        skeleton_ids = set(skeleton_nodes.keys())
+        ranges_to_keep = []
+
+        def traverse(node):
+            if node.id in full_nodes:
+                ranges_to_keep.append((node.start_byte, node.end_byte))
+                return
+
+            if node.id not in skeleton_ids:
+                return
+
+            if node.type == 'function_definition':
+                body = node.child_by_field_name('body')
+                if body:
+                    ranges_to_keep.append((node.start_byte, body.start_byte))
+                else:
+                    ranges_to_keep.append((node.start_byte, node.end_byte))
+                for child in node.children:
+                    traverse(child)
+
+            elif node.type == 'compound_statement':
+                ranges_to_keep.append((node.start_byte, node.start_byte + 1))
+                ranges_to_keep.append((node.end_byte - 1, node.end_byte))
+                for child in node.children:
+                    traverse(child)
+
+            elif node.type == 'if_statement':
+                cond = node.child_by_field_name('condition')
+                if cond:
+                    for child in node.children:
+                        if child.type == ')' and child.start_byte >= cond.end_byte:
+                            ranges_to_keep.append((node.start_byte, child.end_byte))
+                            break
+                    else:
+                        ranges_to_keep.append((node.start_byte, cond.end_byte))
+                else:
+                    ranges_to_keep.append((node.start_byte, node.start_byte + 2))
+
+                for child in node.children:
+                    if child.type == 'else':
+                        alt = node.child_by_field_name('alternative')
+                        if alt and (alt.id in skeleton_ids or alt.id in full_nodes):
+                            ranges_to_keep.append((child.start_byte, child.end_byte))
+                    traverse(child)
+
+            elif node.type in ['for_statement', 'while_statement', 'do_statement', 'switch_statement']:
+                cond = node.child_by_field_name('condition')
+                if cond:
+                    for child in node.children:
+                        if child.type == ')' and child.start_byte >= cond.end_byte:
+                            ranges_to_keep.append((node.start_byte, child.end_byte))
+                            break
+                    else:
+                        ranges_to_keep.append((node.start_byte, cond.end_byte))
+                for child in node.children:
+                    traverse(child)
+
+            else:
+                for child in node.children:
+                    traverse(child)
+
+        traverse(tree.root_node)
+
+        # 5. 区间排序与去重合并
         ranges_to_keep.sort(key=lambda x: x[0])
         merged_ranges = []
         for current in ranges_to_keep:
@@ -502,76 +642,31 @@ class IdentifierAnalyzer:
                 merged_ranges.append(current)
             else:
                 last = merged_ranges[-1]
-                if current[0] <= last[1] + 15:  # 容忍 15 字节以内的空白符吞并
+                if current[0] <= last[1] + 15:
                     merged_ranges[-1] = (last[0], max(last[1], current[1]))
                 else:
                     merged_ranges.append(current)
 
-        # 注入点整理
-        unique_insertions = list(set(insertions))
-        ins_dict = {}
-        for off, txt in unique_insertions:
-            if off not in ins_dict:
-                ins_dict[off] = []
-            ins_dict[off].append(txt)
-
+        # 6. 重组文本流
         output = bytearray()
         last_end = 0
 
-        # 重构文本，精准应用保留区间与大括号注入
         for start, end in merged_ranges:
-            gap_insertions = [(off, txts) for off, txts in ins_dict.items() if last_end <= off <= start]
-            gap_insertions.sort(key=lambda x: x[0])
-
-            gap_cursor = last_end
-            for off, txts in gap_insertions:
-                if off - gap_cursor > 15:
-                    if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
-                        output.extend(b"\n    /* ... */\n")
-                else:
-                    output.extend(source_code[gap_cursor:off])
-                for txt in txts:
-                    output.extend(txt)
-                gap_cursor = off
-
-            if start - gap_cursor > 15:
+            gap = start - last_end
+            if gap > 15:
                 if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
                     output.extend(b"\n    /* ... */\n")
             else:
-                output.extend(source_code[gap_cursor:start])
+                output.extend(source_code[last_end:start])
 
-            keep_cursor = start
-            inside_insertions = [(off, txts) for off, txts in ins_dict.items() if start < off < end]
-            inside_insertions.sort(key=lambda x: x[0])
-
-            for off, txts in inside_insertions:
-                output.extend(source_code[keep_cursor:off])
-                for txt in txts:
-                    output.extend(txt)
-                keep_cursor = off
-
-            output.extend(source_code[keep_cursor:end])
+            output.extend(source_code[start:end])
             last_end = end
 
-        final_insertions = [(off, txts) for off, txts in ins_dict.items() if off >= last_end]
-        final_insertions.sort(key=lambda x: x[0])
-
-        gap_cursor = last_end
-        for off, txts in final_insertions:
-            if off - gap_cursor > 15:
-                if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
-                    output.extend(b"\n    /* ... */\n")
-            else:
-                output.extend(source_code[gap_cursor:off])
-            for txt in txts:
-                output.extend(txt)
-            gap_cursor = off
-
-        if len(source_code) - gap_cursor > 15:
+        if len(source_code) - last_end > 15:
             if not (output.endswith(b"/* ... */\n") or output.endswith(b"/* ... */")):
                 output.extend(b"\n    /* ... */\n")
         else:
-            output.extend(source_code[gap_cursor:len(source_code)])
+            output.extend(source_code[last_end:len(source_code)])
 
         return output.decode("utf-8", errors="replace")
 

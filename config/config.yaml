@@ -8,24 +8,24 @@ global:
 run_params:
   samples: 100
   dataset: "./data/bigvul_polars.parquet"
-  iterations: 20
-  algorithm: "bo"
+  iterations: 25
+  algorithm: "beam"
   run_mode: "attack"
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   use_majority_voting: false
 
 # Target Models
 model_zoo:
-  CodeBERT: "./models/binary_diversevul_codebert"
+  CodeBERT: "./models/binary_diversevul_codebert_pure_dataset"
 
 llm_generator_name: "models/qwen2.5-1.5b-code"
 
 # Candidate Generation Configurations
 lightweight_candidate:
   top_m: 15
-  fasttext_model_path: "./models/fasttext_cpp.bin"
-  faiss_index_path: "./models/faiss_cpp.index"
-  faiss_vocab_path: "./models/vocab_cpp.json"
+  fasttext_model_path: "./models/pretrained/fasttext_cpp.bin"
+  faiss_index_path: "./models/pretrained/faiss_cpp.index"
+  faiss_vocab_path: "./models/pretarined/vocab_cpp.json"
 
 heavyweight_candidate:
   top_k_mlm: 60

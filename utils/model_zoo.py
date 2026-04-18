@@ -137,6 +137,10 @@ class ModelZoo:
                 outputs = m["model"](**inputs)
                 probs = torch.softmax(outputs.logits, dim=-1).squeeze().cpu().numpy().tolist()
                 pred_label = int(np.argmax(probs))
+
+                if self.eval_mode == "binary" and pred_label == 0:
+                    pred_label = -1
+
             return probs, pred_label
 
     def _base_batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
@@ -178,6 +182,10 @@ class ModelZoo:
                     probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
                     probs = [probs.tolist()] if probs.ndim == 1 else probs.tolist()
                     preds = [int(np.argmax(p)) for p in probs]
+
+                    if self.eval_mode == "binary":
+                        preds = [1 if p == 1 else -1 for p in preds]
+
                     all_probs.extend(probs)
                     all_preds.extend(preds)
             return all_probs, all_preds

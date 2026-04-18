@@ -14,7 +14,7 @@ from attacks.NormalizationAttacker import NormalizationAttacker
 from attacks.RandomAttacker import RandomAttacker
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset import DatasetLoader
-from utils.llm_loder import LocalLLMClient
+from utils.llm_loader import LocalLLMClient
 from utils.miner import NamingDataMiner
 from utils.mlm_engine import MLMEngine
 from utils.model_zoo import ModelZoo, CodeSmoother

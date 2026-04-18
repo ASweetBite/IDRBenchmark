@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 # 保持原有导入不变
 from attacks.HeavyWeightCandidateGenerator import HeavyWeightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer
-from utils.llm_loder import LocalLLMClient
+from utils.llm_loader import LocalLLMClient
 from utils.mlm_engine import MLMEngine
 from utils.miner import NamingDataMiner
 

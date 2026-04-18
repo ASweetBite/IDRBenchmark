@@ -124,7 +124,7 @@ def prepare_dataset(parquet_path):
     print(f"[*] 真实标签分布: 安全(0)={real_safe_count}, 漏洞(1)={real_vul_count}")
 
     # 设定总量目标 (每类 8 万，总共 16 万)
-    target_count = 80000
+    target_count = 18945
 
     # ================= 🚀 修改 2：实现完美的对称增强 =================
 
