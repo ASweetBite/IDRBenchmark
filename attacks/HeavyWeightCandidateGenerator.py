@@ -7,6 +7,7 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
 from utils.ast_tools import CodeTransformer
 
@@ -82,43 +83,6 @@ class HeavyWeightCandidateGenerator:
             return "".join(res).replace(mask_token.capitalize(), mask_token)
         else:
             return mask_token
-
-    def _assemble_multi_candidate(self, parts: List[str], start: int, end: int, predicted_words: tuple, style: str,
-                                  target_name: str) -> str:
-        """Reassembles an identifier using words predicted by the model at masked positions."""
-        new_parts = parts[:start] + list(predicted_words) + parts[end:]
-
-        if style == '_':
-            return "_".join(new_parts)
-        elif style == 'camel':
-            res = []
-            for j, p in enumerate(new_parts):
-                res.append(p.lower() if j == 0 and target_name[0].islower() else p.capitalize())
-            return "".join(res)
-        else:
-            return "".join(predicted_words)
-
-    def _get_code_embedding_batched(self, code_snippets: List[str], batch_size: int = 32) -> torch.Tensor:
-        """Performs batch inference to get sequence-level embeddings for code snippets using Mean Pooling."""
-        all_embeddings = []
-        tokenizer = self.mlm_engine.tokenizer
-
-        for i in range(0, len(code_snippets), batch_size):
-            batch_texts = code_snippets[i: i + batch_size]
-            inputs = tokenizer(
-                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=512
-            ).to(self.mlm_engine.device)
-
-            with torch.no_grad():
-                outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
-                last_hidden = outputs.hidden_states[-1]
-                attention_mask = inputs['attention_mask'].unsqueeze(-1).expand(last_hidden.size()).float()
-                sum_embeddings = torch.sum(last_hidden * attention_mask, dim=1)
-                sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
-                mean_pooled = sum_embeddings / sum_mask
-                all_embeddings.append(mean_pooled.cpu().detach())
-
-        return torch.cat(all_embeddings, dim=0)
 
     def _get_model_logits_batched(self, cropped_codes: List[str]):
         """Performs batch inference to obtain model logits and mask indices for multiple code snippets."""
@@ -204,11 +168,21 @@ class HeavyWeightCandidateGenerator:
             return None
 
     def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
-                                       batch_size: int = 32) -> torch.Tensor:
-        """精准定位 BPE 分词后的变量边界，提取Token级变量语义向量"""
+                                       batch_size: int = 64) -> torch.Tensor:
+        """精准定位 BPE 分词后的变量边界，提取Token级变量语义向量（支持半精度）"""
         all_embeddings = []
         tokenizer = self.mlm_engine.tokenizer
         full_texts = [p + v + s for p, v, s in zip(prefixes, var_names, suffixes)]
+
+        # 提前确定设备和精度类型
+        device = self.mlm_engine.device
+        # 如果是 Ampere 架构（如 RTX 30/40, A100），建议用 bfloat16，否则用 float16
+        dtype = torch.float16
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8:
+            dtype = torch.bfloat16
+
+        # 建议确保模型已经在 half 模式（可选，autocast 也会处理，但提前转更节省显存）
+        self.mlm_engine.model.to(dtype)
 
         for i in range(0, len(full_texts), batch_size):
             batch_texts = full_texts[i: i + batch_size]
@@ -217,11 +191,13 @@ class HeavyWeightCandidateGenerator:
 
             inputs = tokenizer(
                 batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=256
-            ).to(self.mlm_engine.device)
+            ).to(device)
 
             with torch.no_grad():
-                outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
-                last_hidden = outputs.hidden_states[-1]
+                # 开启自动混合精度推理
+                with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                    outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
+                    last_hidden = outputs.hidden_states[-1]
 
             cached_p_tokens = {}
 
@@ -246,8 +222,11 @@ class HeavyWeightCandidateGenerator:
                 end_idx = min(max(start_idx + 1, end_idx), 256)
 
                 target_hiddens = last_hidden[b_idx, start_idx:end_idx, :]
+
+                # 计算均值
                 pooled = target_hiddens.mean(dim=0)
-                all_embeddings.append(pooled.cpu().detach())
+
+                all_embeddings.append(pooled.to(torch.float32).cpu())
 
         return torch.stack(all_embeddings)
 
@@ -378,10 +357,10 @@ class HeavyWeightCandidateGenerator:
                         if has_partial_overlap:
                             if len(target_parts) <= 3 :
                                 # 只改了一部分，如果相似度还不高说明改坏了，较大幅度拉高阈值
-                                current_threshold = min(0.98, base_threshold + 0.08)
+                                current_threshold = min(0.98, base_threshold + 0.05)
                             # MLM 短变量替换：(如 pvma -> p_vma)，字面全换，适度降低阈值包容多样性
                             else:
-                                current_threshold = min(0.99, base_threshold + 0.13)
+                                current_threshold = min(0.99, base_threshold + 0.1)
                         elif len(target_parts) == 1:
                             current_threshold = base_threshold
 
@@ -603,7 +582,7 @@ JSON
                 context_code=code_str,
                 target_name=target_name,
                 style=original_style,
-                top_n=int(top_n_keep * 1.5),
+                top_n=int(top_n_keep * 2),
                 entity_type=entity_type,
                 n_parts=n_parts
             )
@@ -767,8 +746,8 @@ JSON
             quota_mlm = top_n_keep - quota_llm
 
             base_thresh = self.config.get('semantic_threshold', 0.85)
-            current_base_thresh = max(0.75, base_thresh - 0.05) if meta["n_parts"] > 1 else base_thresh
-
+            # current_base_thresh = max(0.75, base_thresh - 0.05) if meta["n_parts"] > 1 else base_thresh
+            current_base_thresh = base_thresh
             all_usages = meta["identifiers"][meta["target_name"]]
             found_return_type = next((u['return_type'] for u in all_usages if u.get('return_type')), None)
 

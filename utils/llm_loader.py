@@ -77,7 +77,7 @@ class LocalLLMClient:
 
         outputs = self.model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=400,
             temperature=0.85,
             top_p=0.95,
             # repetition_penalty=1.15,
