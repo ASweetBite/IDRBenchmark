@@ -1,28 +1,19 @@
-import itertools
-import json
-import random
 import re
-from collections import defaultdict
-from typing import List, Dict, Any
-
+import itertools
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-
-from utils.ast_tools import CodeTransformer
+from typing import List, Dict, Any
 
 
-class HeavyWeightCandidateGenerator:
-    def __init__(self, embedder, llm_client, analyzer, config):
+class LightweightCandidateGenerator:
+    def __init__(self, mlm_engine, analyzer, config):
         """
-        初始化重量级候选词生成器 (仅依赖 LLM 进行深度语义改写)
-        :param embedder: 用于提取 Token Embedding 和计算相似度的模型 (原 mlm_engine)
-        :param llm_client: 用于生成候选词的大模型客户端
-        :param analyzer: AST 语法树与上下文分析器
-        :param config: 全局配置
+        初始化轻量级生成器（仅依赖 MLM，用作快速探针与初步攻击空间构建）
+        :param mlm_engine: 用于掩码预测、提取 Token Embedding 和计算相似度的模型
+        :param analyzer: 语法树与上下文分析器
+        :param config: 全局配置字典
         """
-        self.embedder = embedder
-        self.llm_client = llm_client
+        self.mlm_engine = mlm_engine
         self.analyzer = analyzer
         self.config = config
         stats_path = config.get('naming_stats_path', 'naming_stats.json')
@@ -31,7 +22,7 @@ class HeavyWeightCandidateGenerator:
         self.scorer = StatisticalNamingScorer(stats_path)
 
     # =========================================================================
-    # 基础工具与命名规范检测
+    # 基础工具与命名规范检测 (原样保留)
     # =========================================================================
     def _detect_naming_style(self, name: str) -> str:
         if '_' in name:
@@ -61,16 +52,34 @@ class HeavyWeightCandidateGenerator:
             if not parts or (len(parts) == 1 and parts[0] == name): return [name], ''
             return parts, 'camel'
 
+    def _build_masked_string(self, parts: List[str], start: int, end: int, num_masks: int, style: str, mask_token: str,
+                             target_name: str) -> str:
+        mask_list = [mask_token] * num_masks
+        new_parts = parts[:start] + mask_list + parts[end:]
+
+        if style == '_':
+            return "_".join(new_parts)
+        elif style == 'camel':
+            res = []
+            for j, p in enumerate(new_parts):
+                if p == mask_token:
+                    res.append(p)
+                else:
+                    res.append(p.lower() if j == 0 and target_name[0].islower() else p.capitalize())
+            return "".join(res).replace(mask_token.capitalize(), mask_token)
+        else:
+            return mask_token
+
     # =========================================================================
-    # AST 上下文与向量相似度验证
+    # 上下文提取与模型推理交互
     # =========================================================================
     def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int) -> tuple[str, str]:
         from tree_sitter import Parser
         parser = Parser()
         parser.language = self.analyzer.language
         tree = parser.parse(code_bytes)
-
         node = tree.root_node.descendant_for_byte_range(target_start, target_end)
+
         if not node:
             line_start = code_bytes.rfind(b'\n', 0, target_start) + 1
             line_end = code_bytes.find(b'\n', target_end)
@@ -89,7 +98,6 @@ class HeavyWeightCandidateGenerator:
         stmt_end = statement_node.end_byte
         local_prefix = code_bytes[stmt_start:target_start].decode("utf-8", errors="replace")
         local_suffix = code_bytes[target_end:stmt_end].decode("utf-8", errors="replace")
-
         return local_prefix, local_suffix
 
     def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict]) -> int:
@@ -101,27 +109,55 @@ class HeavyWeightCandidateGenerator:
             occ = occurrences[i]
             local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'])
             score = len(local_prefix) + len(local_suffix)
-
             if '(' in local_suffix or ',' in local_suffix: score += 100
             if any(k in local_prefix for k in ['if ', 'while ', 'for ', 'return ']): score += 80
             if re.search(r'=\s*(0|NULL|nullptr|false|true|\{\})\s*;', local_suffix): score -= 150
-
             if score > max_score:
                 max_score = score
                 best_idx = i
         return best_idx
 
+    def _get_model_logits_batched(self, cropped_codes: List[str]):
+        if not cropped_codes: return None, []
+        inputs = self.mlm_engine.tokenizer(
+            cropped_codes, return_tensors="pt", padding=True, truncation=True, max_length=512
+        ).to(self.mlm_engine.device)
+        mask_token_id = self.mlm_engine.tokenizer.mask_token_id
+
+        with torch.no_grad():
+            batch_logits = self.mlm_engine.model(**inputs).logits
+
+        batch_mask_indices = [(inputs.input_ids[i] == mask_token_id).nonzero(as_tuple=True)[0] for i in
+                              range(batch_logits.size(0))]
+        return batch_logits, batch_mask_indices
+
+    def _decode_words(self, mask_logits, top_k, allow_underscore=False, required_length=None):
+        _, top_indices = torch.topk(mask_logits, top_k, dim=-1)
+        words = []
+        for idx in top_indices:
+            w = self.mlm_engine.tokenizer.decode([idx]).strip().replace('Ġ', '').replace('##', '')
+            if allow_underscore:
+                w = re.sub(r'[^a-zA-Z0-9_]', '', w)
+                if not w or (not w[0].isalpha() and w[0] != '_'): continue
+            else:
+                w = re.sub(r'[^a-zA-Z0-9]', '', w)
+                if not w: continue
+            if required_length is not None and len(w) != required_length: continue
+            words.append(w)
+        return words
+
+    # =========================================================================
+    # 复杂度过滤系统 (特征提取与验证)
+    # =========================================================================
     def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
                                        batch_size: int = 64) -> torch.Tensor:
-        """精准提取Token级变量语义向量（仅用于计算 LLM 候选词的相似度）"""
         all_embeddings = []
-        tokenizer = self.embedder.tokenizer
+        tokenizer = self.mlm_engine.tokenizer
         full_texts = [p + v + s for p, v, s in zip(prefixes, var_names, suffixes)]
-
-        device = self.embedder.device
+        device = self.mlm_engine.device
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[
             0] >= 8 else torch.float16
-        self.embedder.model.to(dtype)
+        self.mlm_engine.model.to(dtype)
 
         for i in range(0, len(full_texts), batch_size):
             batch_texts = full_texts[i: i + batch_size]
@@ -132,7 +168,7 @@ class HeavyWeightCandidateGenerator:
                 device)
 
             with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype):
-                outputs = self.embedder.model(**inputs, output_hidden_states=True)
+                outputs = self.mlm_engine.model(**inputs, output_hidden_states=True)
                 last_hidden = outputs.hidden_states[-1]
 
             cached_p_tokens = {}
@@ -153,17 +189,6 @@ class HeavyWeightCandidateGenerator:
 
         return torch.stack(all_embeddings)
 
-    def _verify_ast_single(self, cand: str, ctx: dict) -> str | None:
-        if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
-            return None
-        try:
-            from utils.ast_tools import CodeTransformer  # 确保导入路径正确
-            CodeTransformer.validate_and_apply(ctx['code_bytes'], ctx['identifiers'], {ctx['target_name']: cand},
-                                               analyzer=self.analyzer)
-            return cand
-        except Exception:
-            return None
-
     def _is_trivial_change(self, target_name: str, cand: str) -> bool:
         target_parts, _ = self._split_identifier(target_name)
         cand_parts, _ = self._split_identifier(cand)
@@ -172,6 +197,18 @@ class HeavyWeightCandidateGenerator:
             change_ratio = 1.0 - (identical_count / max(len(target_parts), len(cand_parts)))
             return change_ratio <= 0.33
         return False
+
+    def _verify_ast_single(self, cand: str, ctx: dict) -> str | None:
+        if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
+            return None
+        # 使用你外部配置的 CodeTransformer 进行校验
+        try:
+            from utils.ast_tools import CodeTransformer  # 根据实际路径调整
+            CodeTransformer.validate_and_apply(ctx['code_bytes'], ctx['identifiers'], {ctx['target_name']: cand},
+                                               analyzer=self.analyzer)
+            return cand
+        except Exception:
+            return None
 
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx):
         """完全还原：纯粹的余弦相似度 + Heuristic Bonus 过滤逻辑"""
@@ -193,7 +230,7 @@ class HeavyWeightCandidateGenerator:
         if base_threshold > 0:
             orig_emb = self._get_variable_token_embeddings(
                 [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
-            ).to(self.embedder.device)  # 如果是 LLM 生成器这里是 self.embedder.device
+            ).to(self.mlm_engine.device)  # 如果是 LLM 生成器这里是 self.embedder.device
 
         added = 0
         CHUNK_SIZE = max(50, quota * 2)
@@ -231,7 +268,7 @@ class HeavyWeightCandidateGenerator:
                 suffixes = [ctx['local_suffix']] * len(filtered_chunk)
 
                 cand_embs = self._get_variable_token_embeddings(prefixes, filtered_chunk, suffixes).to(
-                    self.embedder.device)
+                    self.mlm_engine.device)
                 sims = F.cosine_similarity(orig_emb, cand_embs)
 
                 for cand, sim, bonus in zip(filtered_chunk, sims, heuristic_bonuses):
@@ -254,61 +291,21 @@ class HeavyWeightCandidateGenerator:
         return added
 
     # =========================================================================
-    # LLM 核心交互逻辑
+    # 核心入口: 仅执行 MLM 生成与过滤
     # =========================================================================
-    def _build_llm_prompt(self, context_code: str, target_name: str, style: str, top_n: int, entity_type: str,
-                          n_parts: int) -> str:
-        if entity_type == 'VARIABLE':
-            entity_rule = "Use NOUNS only (e.g., 'data_buffer'). NO verbs."
-        elif entity_type == 'BOOLEAN_VAR':
-            entity_rule = "Use BOOLEAN prefixes (e.g., 'is_', 'has_', 'can_')."
-        else:
-            entity_rule = "Use ACTION VERBS (e.g., 'get_data', 'update_state')."
-
-        if n_parts <= 2:
-            max_allowed_parts = n_parts + 1
-            strategy_instruction = f"""[Strategy: Short & Concise]
-- MAX WORDS: {max_allowed_parts} words per name.
-- EXAMPLES: "shm_info", "mem_data", "idx"
-- Use common C/C++ abbreviations (ptr, buf, mem, val)."""
-        else:
-            strategy_instruction = """[Strategy: Semantic Refactoring]
-- Provide professional synonyms matching the exact system logic.
-- Keep the length similar to the original name."""
-
-        return f"""You are an expert C/C++ developer. Suggest exactly {top_n} alternative names for `{target_name}`.
-
-[Context Code]
-```cpp
-{context_code}
-{strategy_instruction}
-
-[Strict Rules]
-{entity_rule}
-STYLE: Use {style} naming convention.
-NO generic names ("new_var", "temp").
-
-[Task]
-Output ONLY a JSON array containing EXACTLY {top_n} strings. Do not explain.
-Example format for {top_n} items: ["name1", "name2", "name3", ...]
-
-JSON
-["""
-
-
-    def generate_candidates(self, vulnerable_tasks: List[Dict[str, Any]], target_quota: int = 20) -> Dict[str, List[str]]:
+    def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 20) -> Dict[
+        str, List[str]]:
         """
-        专门为 RNNS 选出的薄弱点调用 LLM 深度生成。
-        :param vulnerable_tasks: 仅包含需要重度打击的 Target 节点
-        :param target_quota: 需要 LLM 生成的目标合法词汇数量
+        批量快速生成 MLM 候选词。
+        返回的数据将直接送入 RNNS 进行显著性排序。
         """
-        results = {task["target_name"]: [] for task in vulnerable_tasks}
-
-        llm_prompts = []
+        results = {task["target_name"]: [] for task in batch_tasks}
+        mlm_tracking = []
         task_metadata = {}
+        mask_token = self.mlm_engine.tokenizer.mask_token
 
-        # 1. 解析任务并构建 Prompt
-        for task_idx, task in enumerate(vulnerable_tasks):
+        # 1. 任务解析与 MLM 变体构建
+        for task_idx, task in enumerate(batch_tasks):
             target_name = task["target_name"]
             code_str = task["code_str"]
             code_bytes = code_str.encode("utf-8")
@@ -319,10 +316,8 @@ JSON
             best_occ_idx = self._find_best_context_occurrence(code_bytes, identifiers[target_name])
             target_info = identifiers[target_name][best_occ_idx]
 
-            raw_entity_type = target_info.get('entity_type', 'variable')
             entity_type = 'BOOLEAN_VAR' if target_name.startswith(('is_', 'has_', 'can_', 'should_')) else (
-                'FUNCTION' if raw_entity_type == 'function' else 'VARIABLE')
-
+                'FUNCTION' if target_info.get('entity_type') == 'function' else 'VARIABLE')
             original_style = self._detect_naming_style(target_name)
             parts, style = self._split_identifier(target_name)
             local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, target_info['start'],
@@ -331,64 +326,89 @@ JSON
             task_metadata[task_idx] = {
                 "target_name": target_name, "parts": parts, "style": style, "n_parts": len(parts),
                 "identifiers": identifiers, "entity_type": entity_type, "original_style": original_style,
-                "code_bytes": code_bytes, "local_prefix": local_prefix, "local_suffix": local_suffix
+                "code_bytes": code_bytes, "local_prefix": local_prefix, "local_suffix": local_suffix,
+                "raw_mlm_cands": []
             }
 
-            # 生成两倍于 target_quota 的词以备过滤消耗
-            prompt = self._build_llm_prompt(code_str, target_name, original_style, target_quota * 2, entity_type,
-                                            len(parts))
-            llm_prompts.append(prompt)
+            prefix_str = local_prefix[max(0, len(local_prefix) - 700):]
+            suffix_str = local_suffix[:700]
 
-        if not llm_prompts: return results
+            variations = []
+            if len(parts) == 1:
+                variations.extend([
+                    {'expand_mode': 'none', 'num_masks': 1, 'masked_str': mask_token},
+                    {'expand_mode': 'prefix', 'num_masks': 1, 'masked_str': f"{mask_token}_{target_name}"},
+                    {'expand_mode': 'suffix', 'num_masks': 1, 'masked_str': f"{target_name}_{mask_token}"}
+                ])
+            else:
+                for i in range(len(parts)):
+                    variations.append({'expand_mode': 'sub', 'start': i, 'end': i + 1, 'num_masks': 1,
+                                       'masked_str': self._build_masked_string(parts, i, i + 1, 1, style, mask_token,
+                                                                               target_name)})
+                if len(parts) >= 2:
+                    for i in range(len(parts) - 1):
+                        variations.append({'expand_mode': 'sub', 'start': i, 'end': i + 2, 'num_masks': 2,
+                                           'masked_str': self._build_masked_string(parts, i, i + 2, 2, style,
+                                                                                   mask_token, target_name)})
 
-        # 2. 批量请求 LLM
-        try:
-            llm_responses = self.llm_client.batch_chat(llm_prompts)
-        except Exception as e:
-            print(f"[!] LLM Batch Chat Failed: {e}")
-            llm_responses = [""] * len(llm_prompts)
+            for var in variations:
+                mlm_tracking.append({"task_idx": task_idx, "cropped_code": prefix_str + var['masked_str'] + suffix_str,
+                                     "variation_info": var})
 
-        # 3. 解析与过滤
-        for resp_idx, response in enumerate(llm_responses):
-            meta = task_metadata[resp_idx]
-            parsed_cands = []
+        if not task_metadata: return results
 
-            if response and isinstance(response, str):
-                clean_text = response.replace("```json", "").replace("```", "").strip()
-                first_quote, last_quote = clean_text.find('"'), clean_text.rfind('"')
+        # 2. 批量 MLM 推理
+        all_cropped_codes = [item["cropped_code"] for item in mlm_tracking]
+        batch_logits, batch_mask_indices = self._get_model_logits_batched(all_cropped_codes)
 
-                if first_quote != -1 and last_quote != -1 and first_quote != last_quote:
-                    patched_json = f"[{clean_text[first_quote:last_quote + 1]}]"
-                    try:
-                        parsed_cands = json.loads(patched_json)
-                        if not isinstance(parsed_cands, list): parsed_cands = [str(parsed_cands)]
-                    except Exception:
-                        pass
+        # 3. 解析 MLM 输出
+        def _join_parts(new_parts, orig_name, st):
+            if st == '_':
+                return "_".join(new_parts)
+            elif st == 'camel':
+                return "".join(
+                    p.lower() if j == 0 and orig_name[0].islower() else p.capitalize() for j, p in enumerate(new_parts))
+            return "".join(new_parts)
 
-                if not parsed_cands:
-                    parsed_cands = re.findall(r'["\']([a-zA-Z0-9_]+)["\']', response)
+        if batch_logits is not None:
+            for i, track_info in enumerate(mlm_tracking):
+                meta = task_metadata[track_info["task_idx"]]
+                var_info = track_info["variation_info"]
+                logits = batch_logits[i:i + 1]
+                mask_indices = batch_mask_indices[i]
+                num_masks = var_info.get('num_masks', 1)
 
-            valid_cands, oversized_cands = [], []
-            for c in parsed_cands:
-                if isinstance(c, str) and c.strip():
-                    clean_cand = c.strip()
-                    if clean_cand in valid_cands or clean_cand in oversized_cands: continue
+                if len(mask_indices) < num_masks: continue
 
-                    cand_parts_list, _ = self._split_identifier(clean_cand)
-                    limit = meta["n_parts"] + 1 if meta["n_parts"] <= 2 else meta["n_parts"] + 2
+                if num_masks == 1:
+                    words = self._decode_words(logits[0, mask_indices[0], :], top_k_mlm)
+                    for w in words:
+                        if var_info.get('expand_mode') == 'prefix':
+                            meta["raw_mlm_cands"].append(f"{w}_{meta['target_name']}")
+                        elif var_info.get('expand_mode') == 'suffix':
+                            meta["raw_mlm_cands"].append(f"{meta['target_name']}_{w}")
+                        else:
+                            if meta["n_parts"] == 1:
+                                meta["raw_mlm_cands"].append(w)
+                            else:
+                                meta["raw_mlm_cands"].append(_join_parts(
+                                    meta["parts"][:var_info['start']] + [w] + meta["parts"][var_info['end']:],
+                                    meta["target_name"], meta["style"]))
+                elif num_masks == 2:
+                    top_k_2holes = min(4, max(2, top_k_mlm // 4))
+                    words1 = self._decode_words(logits[0, mask_indices[0], :], top_k_2holes)
+                    words2 = self._decode_words(logits[0, mask_indices[1], :], top_k_2holes)
+                    for w1, w2 in itertools.product(words1, words2):
+                        meta["raw_mlm_cands"].append(
+                            _join_parts(meta["parts"][:var_info['start']] + [w1, w2] + meta["parts"][var_info['end']:],
+                                        meta["target_name"], meta["style"]))
 
-                    if len(cand_parts_list) <= limit:
-                        valid_cands.append(clean_cand)
-                    else:
-                        oversized_cands.append(clean_cand)
-
-            min_threshold = int(target_quota * 0.8)
-            if len(valid_cands) < min_threshold and oversized_cands:
-                valid_cands.extend(oversized_cands[:min_threshold - len(valid_cands)])
-
-            # 应用基于 Embedding 的过滤系统
+        # 4. 执行复杂度过滤系统
+        for t_idx, meta in task_metadata.items():
+            unique_mlm_cands = list(dict.fromkeys(meta["raw_mlm_cands"]))
             ctx = {
-                'code_bytes': meta["code_bytes"], 'target_name': meta["target_name"], 'identifiers': meta["identifiers"],
+                'code_bytes': meta["code_bytes"], 'target_name': meta["target_name"],
+                'identifiers': meta["identifiers"],
                 'keywords': self.analyzer.keywords, 'original_style': meta["original_style"],
                 'local_prefix': meta["local_prefix"],
                 'local_suffix': meta["local_suffix"], 'semantic_threshold': self.config.get('semantic_threshold', 0.85),
@@ -398,7 +418,7 @@ JSON
             }
 
             final_candidates = []
-            self._verify_and_filter(valid_cands, target_quota, final_candidates, ctx)
+            self._verify_and_filter(unique_mlm_cands, top_n_keep, final_candidates, ctx)
             results[meta["target_name"]] = final_candidates
 
         return results

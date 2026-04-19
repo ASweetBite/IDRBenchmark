@@ -30,7 +30,7 @@ lightweight_candidate:
 heavyweight_candidate:
   top_k_mlm: 60
   top_n_keep: 50
-  semantic_threshold: 0.85
+  semantic_threshold: 0.87
   structural_semantic_threshold: 0.5
   minilm_model_path: "models/binary_diversevul_codebert_pure_dataset"
   context_ratio: 0.1

@@ -25,7 +25,7 @@ except ImportError:
 from utils.ast_tools import IdentifierAnalyzer
 
 
-class LightweightCandidateGenerator:
+class StaticCandidateGenerator:
     def __init__(self, config):
         """Initializes the generator by loading FastText and FAISS models for semantic search."""
         self.config = config.get("lightweight_candidate", {})
