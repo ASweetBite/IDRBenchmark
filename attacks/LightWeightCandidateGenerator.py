@@ -211,15 +211,19 @@ class LightweightCandidateGenerator:
             return None
 
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx):
-        """完全还原：纯粹的余弦相似度 + Heuristic Bonus 过滤逻辑"""
+        """完全还原：纯粹的余弦相似度 + Heuristic Bonus 过滤逻辑，带全链路监控日志"""
         base_threshold = ctx.get('semantic_threshold', 0.85)
         entity_type = ctx.get('entity_type', 'VARIABLE')
 
         # 1. 预过滤：基础检查
         base_cands = []
         for cand in candidate_list:
-            if cand in ctx['keywords'] or cand == ctx['target_name']: continue
-            if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
+            if cand in ctx['keywords'] or cand == ctx['target_name']:
+                print(f"        🚫 [Filter | Keyword/Self] '{cand}'")
+                continue
+            if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand):
+                print(f"        🚫 [Filter | Style Clash] '{cand}' (Expected: {ctx['original_style']})")
+                continue
             base_cands.append(cand)
 
         if not base_cands:
@@ -230,7 +234,7 @@ class LightweightCandidateGenerator:
         if base_threshold > 0:
             orig_emb = self._get_variable_token_embeddings(
                 [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
-            ).to(self.mlm_engine.device)  # 如果是 LLM 生成器这里是 self.embedder.device
+            ).to(self.mlm_engine.device)
 
         added = 0
         CHUNK_SIZE = max(50, quota * 2)
@@ -253,8 +257,12 @@ class LightweightCandidateGenerator:
                         cand_parts, entity_type, target_parts=target_parts, return_type=return_type
                     )
 
-                if bonus <= -100: continue
-                if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand): continue
+                if bonus <= -100:
+                    print(f"        🚫 [Filter | NLP Rules] '{cand}' (Score: {bonus})")
+                    continue
+                if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
+                    print(f"        🚫 [Filter | AST Conflict] '{cand}' (Scope collision or Syntax error)")
+                    continue
 
                 filtered_chunk.append(cand)
                 heuristic_bonuses.append(bonus)
@@ -262,7 +270,7 @@ class LightweightCandidateGenerator:
             if not filtered_chunk: continue
             semantically_valid = []
 
-            # 3. 核心打分与拦截 (原汁原味)
+            # 3. 核心打分与拦截
             if base_threshold > 0:
                 prefixes = [ctx['local_prefix']] * len(filtered_chunk)
                 suffixes = [ctx['local_suffix']] * len(filtered_chunk)
@@ -274,19 +282,38 @@ class LightweightCandidateGenerator:
                 for cand, sim, bonus in zip(filtered_chunk, sims, heuristic_bonuses):
                     final_score = sim.item() + bonus
 
-                    # 严格按照原逻辑：最终分数 >= 阈值即可
                     if final_score >= base_threshold:
-                        semantically_valid.append(cand)
+                        # 记录符合语义的词汇，留给下一步 AST 验证
+                        semantically_valid.append((cand, final_score, sim.item(), bonus))
+                    else:
+                        print(
+                            f"        🚫 [Filter | Semantic] '{cand}' (Sim: {sim.item():.3f} + Bonus: {bonus:.3f} = {final_score:.3f} < {base_threshold})")
             else:
-                semantically_valid = filtered_chunk
+                # 如果不需要语义打分，直接赋默认分过关
+                semantically_valid = [(cand, 1.0, 1.0, 0.0) for cand in filtered_chunk]
 
             # 4. 最终 AST 验证并加入池
-            for cand in semantically_valid:
+            for cand_data in semantically_valid:
                 if added >= quota: break
+                cand, final_score, sim_val, bonus_val = cand_data
+
                 valid_cand = self._verify_ast_single(cand, ctx)
                 if valid_cand and valid_cand not in final_candidates:
                     final_candidates.append(valid_cand)
                     added += 1
+                    # ==========================================
+                    # 【核心修改】：打印成功通过的所有考核指标
+                    # ==========================================
+                    if base_threshold > 0:
+                        print(
+                            f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Score: {final_score:.3f} = Sim {sim_val:.3f} + Bonus {bonus_val:.3f})")
+                    else:
+                        print(f"        ✅ [Passed | {added}/{quota}] '{valid_cand}' (Semantic check disabled)")
+                else:
+                    if not valid_cand:
+                        print(f"        🚫 [Filter | Final AST] '{cand}' (Failed context insertion verify)")
+                    else:
+                        print(f"        🚫 [Filter | Duplicate] '{cand}' (Already in final pool)")
 
         return added
 

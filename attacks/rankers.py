@@ -2,6 +2,11 @@ import gc
 import torch
 import heapq
 
+import gc
+import torch
+import heapq
+import random
+
 
 class RNNS_Ranker:
     def __init__(self, model_zoo, target_model: str, rename_fn):
@@ -10,7 +15,8 @@ class RNNS_Ranker:
         self.rename_fn = rename_fn
 
     def rank_variables(self, code, variables, subs_pool, reference_label,
-                       test_sample_size=10, top_k=10, filter_short_vars=True):
+                       test_sample_size=10, top_k=10, filter_short_vars=True,
+                       guaranteed_head_size=2):  # [新增] 强制保留头部的词汇数量 (对应探针数量)
 
         oref_idx = 0 if reference_label == -1 else reference_label
         orig_prob = self.model_zoo.predict_label_conf(code, oref_idx, self.target_model)
@@ -20,7 +26,31 @@ class RNNS_Ranker:
 
         # 串行执行重命名，彻底规避 AST Parser 多线程崩溃风险
         for var in valid_vars:
-            candidates = subs_pool.get(var, [])[:test_sample_size]
+            all_cands = subs_pool.get(var, [])
+            if not all_cands:
+                continue
+
+            # =========================================================
+            # [核心修复] 智能采样策略：头部绝对保留 + 尾部多样性采样
+            # =========================================================
+            if len(all_cands) <= test_sample_size:
+                candidates = all_cands
+            else:
+                # 1. 提取头部高优先级词汇 (确保 LLM 探针绝对不被遗漏)
+                head_cands = all_cands[:guaranteed_head_size]
+
+                # 2. 从剩余的词汇 (主要是海量 MLM 兜底词) 中随机抽取
+                # 这样做比死板地取前 8 个 MLM 词更好，能更全面地探测变量对不同乱码/相似词的敏感度分布
+                tail_pool = all_cands[guaranteed_head_size:]
+                sample_count = test_sample_size - len(head_cands)
+
+                if len(tail_pool) >= sample_count:
+                    tail_cands = random.sample(tail_pool, sample_count)
+                else:
+                    tail_cands = tail_pool
+
+                candidates = head_cands + tail_cands
+
             for cand in candidates:
                 if cand != var:
                     try:
@@ -58,10 +88,11 @@ class RNNS_Ranker:
                 var_best_cand[var] = cand
 
         valid_scores = [(var, score) for var, score in var_max_drop.items() if score != -float('inf')]
-        top_k_vars_with_scores = heapq.nlargest(top_k, valid_scores, key=lambda x: x[1])
+        sorted_all_vars_with_scores = sorted(valid_scores, key=lambda x: x[1], reverse=True)
 
-        ranked_vars = [var for var, _ in top_k_vars_with_scores]
-        score_dict = {var: score for var, score in top_k_vars_with_scores}
+        ranked_vars = [var for var, _ in sorted_all_vars_with_scores]
+        score_dict = {var: score for var, score in sorted_all_vars_with_scores}
+
         best_seeds = {var: var_best_cand[var] for var in ranked_vars if var_best_cand[var] != var}
 
         return ranked_vars, score_dict, best_seeds

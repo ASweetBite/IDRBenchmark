@@ -115,7 +115,8 @@ def main(args, config):
         filepath=run_params['dataset'],
         mode=args.mode,
         max_samples=run_params['samples'],
-        label_map_path=run_params.get('label_map')
+        label_map_path=run_params.get('label_map'),
+        random_seed = run_params.get('random_seed', 42)
     )
 
     # 执行攻击

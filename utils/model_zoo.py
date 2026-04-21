@@ -13,6 +13,36 @@ from utils.bert_loader import CodeBERTModelLoader
 
 logger = logging.getLogger(__name__)
 
+class ModelZooQueryTracker:
+    """
+    黑盒查询拦截器：利用代理模式透明地包装 ModelZoo。
+    严格记录针对特定大模型的所有预测查询开销（包含单步预测和批处理预测）。
+    """
+    def __init__(self, model_zoo):
+        self._model_zoo = model_zoo
+        self._query_count = 0
+
+    def reset_counter(self):
+        self._query_count = 0
+
+    def get_query_count(self):
+        return self._query_count
+
+    def predict(self, *args, **kwargs):
+        self._query_count += 1
+        return self._model_zoo.predict(*args, **kwargs)
+
+    def batch_predict(self, codes, *args, **kwargs):
+        self._query_count += len(codes)
+        return self._model_zoo.batch_predict(codes, *args, **kwargs)
+
+    def predict_label_conf(self, *args, **kwargs):
+        self._query_count += 1
+        return self._model_zoo.predict_label_conf(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # 将其他所有未重写的方法/属性（如 model_names）透明转发给底层的 model_zoo
+        return getattr(self._model_zoo, name)
 
 class CodeSmoother:
     def __init__(self, config: Dict, candidate_generator):

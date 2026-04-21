@@ -5,10 +5,6 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
-import random
-import math
-import numpy as np
-
 
 class GeneticAlgorithmOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
@@ -55,9 +51,16 @@ class GeneticAlgorithmOptimizer:
         p_vuln = float(probs[1]) if len(probs) > 1 else 1.0 - p_safe
         return p_safe if is_orig_vuln else p_vuln
 
-    # 🌟 修复：新增 rnns_best_seed 参数接收
-    def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None, rnns_best_seed=None):
+    def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None, rnns_best_seed=None, all_vars=None):
         """Executes a genetic algorithm to find the optimal adversarial variable substitutions."""
+
+        # 1. 确定基因全集与边缘基因
+        if all_vars is None:
+            all_vars = target_vars
+
+        background_vars = [v for v in all_vars if v not in target_vars]
+
+        # 2. 构建非对称变异概率表 (Asymmetric Mutation Probabilities)
         mutation_probs = {}
         if variable_scores and target_vars:
             scores = [variable_scores.get(v, 0) for v in target_vars]
@@ -70,7 +73,12 @@ class GeneticAlgorithmOptimizer:
                 else:
                     mutation_probs[var] = (self.m_rate_min + self.m_rate_max) / 2
         else:
-            mutation_probs = {v: 0.3 for v in target_vars}
+            for v in target_vars: mutation_probs[v] = 0.3
+
+        # 🌟 为边缘基因赋予极低的探索性变异概率（例如 3%）
+        # 这使得 GA 偶尔能摸奖，但大部分算力依然集中在 target_vars 上
+        for var in background_vars:
+            mutation_probs[var] = 0.03
 
         def get_safe_choice(var, pool, current_val=None):
             choices = list(set(pool)) if pool else []
@@ -84,19 +92,28 @@ class GeneticAlgorithmOptimizer:
         best_code, best_fitness, best_probs, best_pred = code, float('-inf'), None, original_pred
         stagnation_counter = 0
 
-        # --- 初始化种群 ---
-        population = [{var: var for var in target_vars}]  # 1. 保留原始代码基因
+        # --- 初始化种群 (此时染色体长度为 len(all_vars)) ---
+        population = [{var: var for var in all_vars}]  # 1. 保留完全不突变的原始基因
 
-        # 🌟 修复：如果 RNNS 传来了优质种子，将其作为精英注入初始种群
+        # 2. 注入 RNNS 精英种子
         if rnns_best_seed:
-            seed_ind = {var: rnns_best_seed.get(var, var) for var in target_vars}
+            seed_ind = {var: rnns_best_seed.get(var, var) for var in all_vars}
             population.append(seed_ind)
 
-        # 填满剩余种群
+        # 3. 填满剩余种群
         while len(population) < self.pop_size:
-            population.append({v: get_safe_choice(v, subs_pool.get(v, [v]) + [v]) for v in target_vars})
+            ind = {}
+            for v in all_vars:
+                # 初始种群生成时，靶点高频突变，边缘基因低频突变
+                if v in target_vars and random.random() < 0.8:
+                    ind[v] = get_safe_choice(v, subs_pool.get(v, [v]) + [v])
+                elif v in background_vars and random.random() < 0.1:
+                    ind[v] = get_safe_choice(v, subs_pool.get(v, [v]) + [v])
+                else:
+                    ind[v] = v
+            population.append(ind)
 
-        print(f"\n--- 🧬 GA 初始化完成 (种群大小: {self.pop_size}) ---")
+        print(f"\n--- 🧬 GA 初始化完成 (种群: {self.pop_size}, 核心基因: {len(target_vars)}, 边缘基因: {len(background_vars)}) ---")
 
         for gen in range(self.max_generations):
             evaluated = []
@@ -105,7 +122,7 @@ class GeneticAlgorithmOptimizer:
 
             previous_best_fitness = best_fitness
 
-            # 收集本代需要评估的代码
+            # 收集评估
             for ind in population:
                 rename_map = {k: v for k, v in ind.items() if k != v}
                 cache_key = frozenset(rename_map.items())
@@ -119,21 +136,17 @@ class GeneticAlgorithmOptimizer:
                     except Exception:
                         fitness_cache[cache_key] = (float('-inf'), original_pred, code, None)
 
-            # 批量查询真实模型
+            # 批量黑盒查询
             if codes_to_predict:
                 batch_probs, batch_preds = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
                 for i in range(len(codes_to_predict)):
                     probs = batch_probs[i]
                     pred = batch_preds[i]
-
-                    # 🌟 统一使用我们安全且强大的适应度计算方法
                     fitness = self._calculate_fitness(probs, original_pred)
-
                     fitness_cache[keys_to_predict[i]] = (fitness, pred, codes_to_predict[i], probs)
 
-            # 评估本代种群并记录最优
+            # 记录最优
             generation_best_fitness = float('-inf')
-
             for ind in population:
                 rename_map = {k: v for k, v in ind.items() if k != v}
                 cache_key = frozenset(rename_map.items())
@@ -143,29 +156,24 @@ class GeneticAlgorithmOptimizer:
                     if probs is not None:
                         evaluated.append((ind, fitness, pred, mutated_code, probs))
 
-                        # 记录本代最优用于内部打印
                         if fitness > generation_best_fitness:
                             generation_best_fitness = fitness
 
-                        # 记录全局最优
                         if fitness > best_fitness:
                             best_fitness, best_code, best_probs, best_pred = fitness, mutated_code, probs, pred
                             current_target_prob = self._get_target_prob(probs, original_pred)
-                            print(
-                                f"  [Gen {gen + 1:02d}] 🌟 突破! 适应度: {fitness:.4f} (↑) | 目标概率: {current_target_prob:.2%} | 预测: {pred}")
+                            print(f"  [Gen {gen + 1:02d}] 🌟 突破! 适应度: {fitness:.4f} | 目标概率: {current_target_prob:.2%} | 预测: {pred}")
 
                         if pred != original_pred and self.run_mode == "attack":
                             final_target_prob = self._get_target_prob(probs, original_pred)
                             print(f"\n🎉 攻击成功！在第 {gen + 1} 代突破防线。最终目标概率: {final_target_prob:.2%}")
                             return True, mutated_code, probs, pred
 
-            # 打印本代摘要日志
             if best_probs is not None:
                 current_target_prob = self._get_target_prob(best_probs, original_pred)
-                print(
-                    f"[Gen {gen + 1:02d}/{self.max_generations}] 繁衍结束 | 历史最优适应度: {best_fitness:.4f} | 目标概率: {current_target_prob:.2%}")
+                print(f"[Gen {gen + 1:02d}/{self.max_generations}] 历史最优适应度: {best_fitness:.4f} | 目标概率: {current_target_prob:.2%}")
 
-            # --- 下方繁衍逻辑保持不变 ---
+            # --- 繁衍逻辑 (交叉与突变现在覆盖全基因段) ---
             unique_evaluated = []
             seen_genes = set()
             for ind_tuple in evaluated:
@@ -181,11 +189,18 @@ class GeneticAlgorithmOptimizer:
 
             unique_evaluated.sort(key=lambda x: x[1], reverse=True)
 
+            # 停滞重启机制 (Restart)
             if stagnation_counter >= self.stagnation_limit:
                 best_elite = unique_evaluated[0][0] if unique_evaluated else population[0]
                 population = [best_elite]
                 while len(population) < self.pop_size:
-                    population.append({v: get_safe_choice(v, subs_pool.get(v, [v]) + [v]) for v in target_vars})
+                    ind = {}
+                    for v in all_vars:
+                        if random.random() < (0.8 if v in target_vars else 0.1):
+                            ind[v] = get_safe_choice(v, subs_pool.get(v, [v]) + [v])
+                        else:
+                            ind[v] = best_elite[v]
+                    population.append(ind)
                 stagnation_counter = 0
                 continue
 
@@ -199,10 +214,12 @@ class GeneticAlgorithmOptimizer:
                 else:
                     p1, p2 = elites[0], elites[0]
 
-                child = {v: (p1[v] if random.random() > 0.5 else p2[v]) for v in target_vars}
+                # 交叉 (Crossover): 在全量变量上进行
+                child = {v: (p1[v] if random.random() > 0.5 else p2[v]) for v in all_vars}
 
+                # 突变 (Mutation): 依据动态/非对称概率字典进行触发
                 for v in child:
-                    if random.random() < mutation_probs.get(v, 0.3):
+                    if random.random() < mutation_probs.get(v, 0.03):
                         child[v] = get_safe_choice(v, subs_pool.get(v, [v]) + [v], current_val=child[v])
 
                 new_pop.append(child)
@@ -319,6 +336,10 @@ class GreedyOptimizer:
         return is_success, overall_best_code, final_probs, final_pred
 
 
+import math
+from typing import List, Tuple, Dict, Any
+
+
 class BeamSearchOptimizer:
     def __init__(self, model_zoo, target_model, rename_fn, mode="binary", config=None):
         self.model_zoo = model_zoo
@@ -328,11 +349,15 @@ class BeamSearchOptimizer:
 
         run_cfg = config.get('run_params', {}) if config else {}
         self.run_mode = run_cfg.get('run_mode', 'attack')
-        # 新增：Beam Search 的束宽参数，默认设为 3，你可以在 config 中调整
-        self.beam_size = run_cfg.get('beam_size', 3)
 
-    def _calculate_fitness(self, probs, original_pred):
-        """辅助函数：计算适应度得分"""
+        self.beam_size = run_cfg.get('beam_size', 3)
+        # 1. 取消了硬截断 max_vars
+        # 2. 分块大小：每次取 N 个候选词进行 GPU 批处理，控制查询粒度
+        self.cand_chunk_size = run_cfg.get('cand_chunk_size', 10)
+        # 3. 局部早停阈值：用于在 LLM 已经取得显著效果时，跳过后续的 MLM 兜底词汇
+        self.early_stop_delta = run_cfg.get('early_stop_delta', 0.3)
+
+    def _calculate_fitness(self, probs: List[float], original_pred: int) -> float:
         orig_idx = 0 if original_pred == -1 else original_pred
         orig_idx = min(orig_idx, len(probs) - 1)
         orig_prob = max(probs[orig_idx], 1e-9)
@@ -345,81 +370,119 @@ class BeamSearchOptimizer:
         else:
             return -orig_prob
 
-    def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
-        """Executes a Beam Search to apply variable substitutions and bypass model defenses."""
+    def run(self, code: str, original_pred: int, target_vars: List[str], subs_pool: Dict[str, List[str]],
+            variable_scores: Dict[str, float] = None):
+        # ==========================================
+        # 核心保证 1: 变量级优先级排序 (优先查高分变量)
+        # ==========================================
         if variable_scores:
+            # 严格按照 RNNS 显著性得分降序排列，确保最脆弱的变量最先被替换
             sorted_vars = sorted(target_vars, key=lambda v: variable_scores.get(v, 0), reverse=True)
         else:
             sorted_vars = target_vars
 
-        # 获取初始状态的 probs
-        orig_probs, orig_pred = self.model_zoo.predict(code, self.target_model)
+        # [修改点] 移除硬截断：sorted_vars = sorted_vars[:self.max_vars]
+
+        query_cache = {}
+
+        def _get_predictions(codes_to_predict: List[str]) -> Tuple[List[List[float]], List[int]]:
+            uncached_codes = [c for c in codes_to_predict if c not in query_cache]
+
+            if uncached_codes:
+                batch_probs, batch_preds = self.model_zoo.batch_predict(uncached_codes, self.target_model)
+                for c, p, pred in zip(uncached_codes, batch_probs, batch_preds):
+                    query_cache[c] = (p, pred)
+
+            cached_results = [query_cache[c] for c in codes_to_predict]
+            probs_list = [res[0] for res in cached_results]
+            preds_list = [res[1] for res in cached_results]
+
+            return probs_list, preds_list
+
+        init_probs, init_preds = _get_predictions([code])
+        orig_probs = init_probs[0]
+        orig_pred = init_preds[0]
+
         initial_fitness = self._calculate_fitness(orig_probs, original_pred)
 
-        # Beam 初始化：存储元组 (fitness, code, probs, pred)
         beam = [(initial_fitness, code, orig_probs, orig_pred)]
-
         overall_best_fitness = initial_fitness
         overall_best_code = code
 
+        # 遍历所有变量（无截断），但因为按 RNNS 排序了，成功大概率发生在前面几次循环
         for var in sorted_vars:
-            candidates = list(set(subs_pool.get(var, [])))
+            candidates = subs_pool.get(var, [])
             if not candidates:
                 continue
 
             new_beam_candidates = []
-            seen_codes = set()  # 用于去重，防止重复预测相同代码
 
             for curr_fitness, curr_code, curr_probs, curr_pred in beam:
-                # 1. 保留当前状态（即不替换该变量），防止强制替换导致性能退化
-                if curr_code not in seen_codes:
-                    new_beam_candidates.append((curr_fitness, curr_code, curr_probs, curr_pred))
-                    seen_codes.add(curr_code)
+                new_beam_candidates.append((curr_fitness, curr_code, curr_probs, curr_pred))
 
-                # 2. 生成所有替换候选项
-                codes_to_predict = []
-                for cand in candidates:
-                    if cand == var:
+                # ==========================================
+                # 核心保证 2: 候选词级的分块与优先级
+                # ==========================================
+                # 按照 cand_chunk_size (例如10) 分块查询，而不是一次查50个
+                for i in range(0, len(candidates), self.cand_chunk_size):
+                    cand_chunk = candidates[i:i + self.cand_chunk_size]
+
+                    codes_to_predict = []
+                    for cand in cand_chunk:
+                        if cand == var:
+                            continue
+                        try:
+                            temp_code = self.rename_fn(curr_code, {var: cand})
+                            if temp_code:
+                                codes_to_predict.append(temp_code)
+                        except Exception:
+                            continue
+
+                    if not codes_to_predict:
                         continue
-                    try:
-                        temp_code = self.rename_fn(curr_code, {var: cand})
-                        if temp_code and temp_code not in seen_codes:
-                            codes_to_predict.append(temp_code)
-                            seen_codes.add(temp_code)
-                    except Exception:
-                        continue
 
-                if not codes_to_predict:
-                    continue
+                    batch_probs, batch_preds = _get_predictions(codes_to_predict)
+                    chunk_best_fitness_gain = 0.0
 
-                # 3. 批量预测
-                batch_probs, batch_preds = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
+                    for probs, pred, temp_code in zip(batch_probs, batch_preds, codes_to_predict):
+                        fitness = self._calculate_fitness(probs, original_pred)
+                        fitness_gain = fitness - curr_fitness
 
-                # 4. 计算并记录候选结果
-                for i, temp_code in enumerate(codes_to_predict):
-                    probs = batch_probs[i]
-                    pred = batch_preds[i]
-                    fitness = self._calculate_fitness(probs, original_pred)
+                        if fitness_gain > chunk_best_fitness_gain:
+                            chunk_best_fitness_gain = fitness_gain
 
-                    # 记录全局最优解（防止 Beam 最后收敛到次优）
-                    if fitness > overall_best_fitness:
-                        overall_best_fitness = fitness
-                        overall_best_code = temp_code
+                        if fitness > overall_best_fitness:
+                            overall_best_fitness = fitness
+                            overall_best_code = temp_code
 
-                    # 提前终止：发现攻击成功的对抗样本
-                    if pred != original_pred and self.run_mode == "attack":
-                        verify_probs, verify_pred = self.model_zoo.predict(temp_code, self.target_model)
-                        if verify_pred != original_pred:
-                            return True, temp_code, verify_probs, verify_pred
+                        # ==========================================
+                        # 核心保证 3: 发现即熔断 (Global Early Return)
+                        # ==========================================
+                        # 一旦在这个分块中发现了导致模型翻转的样本，立刻停止整个搜索流程并返回
+                        if pred != original_pred and self.run_mode == "attack":
+                            verify_probs, verify_preds = _get_predictions([temp_code])
+                            if verify_preds[0] != original_pred:
+                                return True, temp_code, verify_probs[0], verify_preds[0]
 
-                    new_beam_candidates.append((fitness, temp_code, probs, pred))
+                        new_beam_candidates.append((fitness, temp_code, probs, pred))
 
-            # 5. 排序并截断，保留 Top-K (Beam Size) 个最优状态进入下一轮
-            new_beam_candidates.sort(key=lambda x: x[0], reverse=True)
-            beam = new_beam_candidates[:self.beam_size]
+                    # 局部早停：如果当前 Chunk (通常是 LLM 的词) 已经让适应度提升了 early_stop_delta
+                    # 则不必再查后续的 Chunk (通常是 MLM 的兜底词)
+                    if chunk_best_fitness_gain >= self.early_stop_delta:
+                        break
 
-        # 遍历完所有变量后，验证全局最优代码是否成功
-        final_probs, final_pred = self.model_zoo.predict(overall_best_code, self.target_model)
+            unique_candidates = {}
+            for state in new_beam_candidates:
+                if state[1] not in unique_candidates or state[0] > unique_candidates[state[1]][0]:
+                    unique_candidates[state[1]] = state
+
+            sorted_candidates = sorted(unique_candidates.values(), key=lambda x: x[0], reverse=True)
+            beam = sorted_candidates[:self.beam_size]
+
+        final_probs_list, final_preds_list = _get_predictions([overall_best_code])
+        final_probs = final_probs_list[0]
+        final_pred = final_preds_list[0]
+
         is_success = (final_pred != original_pred)
 
         return is_success, overall_best_code, final_probs, final_pred
@@ -479,7 +542,7 @@ class BayesianOptimizer:
 
         return p_safe if is_orig_vuln else p_vuln
 
-    def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None):
+    def run(self, code, original_pred, target_vars, subs_pool, variable_scores=None, rnns_best_seed=None):
         """使用贝叶斯优化在离散空间中寻找最优替换组合"""
 
         valid_vars = [v for v in target_vars if subs_pool.get(v)]
@@ -488,18 +551,24 @@ class BayesianOptimizer:
 
         num_vars = len(valid_vars)
 
-        # 优化2：计算变异权重 (WIR)
         if variable_scores:
             weights = [variable_scores.get(v, 1.0) for v in valid_vars]
             total_weight = sum(weights)
             mutation_probs = [w / total_weight for w in weights]
         else:
-            mutation_probs = None  # 退化为均匀分布
+            mutation_probs = None
 
         var_candidates = {}
         categories_for_encoder = []
+
+        # 🌟 修复 2：强制截断候选空间 (针对 BO 的降维打击)
+        # BO 绝对无法在 50 个候选词中收敛。我们强制只给它每个变量前 10 个最高质量的候选词 (主要涵盖 LLM 生成的优质词)
+        BO_CANDIDATE_LIMIT = 10
+
         for var in valid_vars:
-            cands = [var] + [c for c in set(subs_pool[var]) if c != var]
+            # 取前 BO_CANDIDATE_LIMIT 个词，极大压缩 One-Hot 维度
+            top_cands = subs_pool[var][:BO_CANDIDATE_LIMIT]
+            cands = [var] + [c for c in set(top_cands) if c != var]
             var_candidates[var] = cands
             categories_for_encoder.append(np.arange(len(cands)))
 
@@ -520,15 +589,27 @@ class BayesianOptimizer:
             except Exception:
                 return None
 
-        X_history = []
-        Y_history = []
+        X_history, Y_history = [], []
         seen_states = set()
-
         best_code, best_fitness, best_probs, best_pred = code, float('-inf'), None, original_pred
 
-        # --- 2. 初始化阶段 ---
-        initial_states = [np.zeros(num_vars, dtype=int)]
-        for _ in range(self.init_samples - 1):
+        # --- 初始化阶段 ---
+        initial_states = [np.zeros(num_vars, dtype=int)] # 原代码保留
+
+        # 🌟 修复 3：将 RNNS_BEST_SEED 注入为初始状态
+        if rnns_best_seed:
+            seed_state = []
+            for var in valid_vars:
+                seed_word = rnns_best_seed.get(var, var)
+                # 尝试在截断后的候选词库中找到该词的索引
+                if seed_word in var_candidates[var]:
+                    seed_state.append(var_candidates[var].index(seed_word))
+                else:
+                    seed_state.append(0)
+            initial_states.append(np.array(seed_state))
+
+        # 填充剩余的初始化样本
+        while len(initial_states) < self.init_samples:
             state = [random.randint(0, len(var_candidates[var]) - 1) for var in valid_vars]
             initial_states.append(np.array(state))
 
@@ -536,8 +617,7 @@ class BayesianOptimizer:
         valid_initial_states = []
         for state in initial_states:
             state_tuple = tuple(state)
-            if state_tuple in seen_states:
-                continue
+            if state_tuple in seen_states: continue
             seen_states.add(state_tuple)
 
             mutated_code = state_to_code(state)
@@ -556,85 +636,65 @@ class BayesianOptimizer:
                     return True, codes_to_predict[i], batch_probs[i], batch_preds[i]
 
                 if fit > best_fitness:
-                    best_fitness, best_code, best_probs, best_pred = fit, codes_to_predict[i], batch_probs[i], \
-                    batch_preds[i]
+                    best_fitness, best_code, best_probs, best_pred = fit, codes_to_predict[i], batch_probs[i], batch_preds[i]
 
-        # 监控日志：打印初始化结果
-        if best_probs is not None:
-            target_idx = min(1 if original_pred == -1 else 0, len(best_probs) - 1)
-            initial_target_prob = self._get_target_prob(best_probs, original_pred)
-            print(f"\n--- 🚀 初始化完成 ({self.init_samples} 次查询) ---")
-            print(f"初始最优适应度: {best_fitness:.4f} | 目标类别概率: {initial_target_prob:.2%}\n")
-
-        # --- 3. 贝叶斯优化主循环 ---
-        total_bo_iters = max(1, self.max_iters - self.init_samples)
+        total_bo_iters = max(1, self.max_iters - len(X_history))
 
         for iteration in range(total_bo_iters):
-            if not X_history:
-                break
+            if not X_history: break
 
-            # 优化3：动态 Kappa 衰减 (鼓励前期探索，后期利用)
             progress = iteration / total_bo_iters
             current_kappa = self.kappa_start - (self.kappa_start - self.kappa_end) * progress
 
-            # a. 训练代理模型 (增强泛化能力)
             X_encoded = encoder.transform(X_history)
 
-            # 优化4：防止随机森林早期过拟合
+            # 🌟 修复 4：极其保守的随机森林参数
+            # 因为样本极少，强制限制树的深度和最小叶子节点，防止对少数样本绝对过拟合
             rf = RandomForestRegressor(
-                n_estimators=100,
-                max_depth=8,
-                min_samples_leaf=2,
+                n_estimators=50,       # 减少树的数量，加速
+                max_depth=5,           # 限制树深，强制代理模型学习全局趋势而非记住单个样本
+                min_samples_split=4,   # 叶子分裂限制
                 random_state=42
             )
-            rf.fit(X_encoded, Y_history)
 
-            # b. 使用代理模型在内部探索
+            # 如果历史样本太少，加入微小的高斯噪声防止模型方差崩溃为0
+            if len(X_encoded) < 10:
+                rf.fit(X_encoded, np.array(Y_history) + np.random.normal(0, 1e-5, len(Y_history)))
+            else:
+                rf.fit(X_encoded, Y_history)
+
             candidate_states = []
-
-            # 优化5：提取历史 Top-K 构成精英库，而非仅依赖单一最优解
             top_k_indices = np.argsort(Y_history)[-min(5, len(Y_history)):]
 
             for _ in range(self.acq_samples):
-                if random.random() < 0.8:  # 80% 局部微调
-                    # 从精英库中随机抽取一个作为变异基底
+                if random.random() < 0.8:
                     base_state = X_history[random.choice(top_k_indices)].copy()
+                    num_mutations = random.randint(1, min(max(2, num_vars // 3), num_vars))
 
-                    # 动态变异强度
-                    num_mutations = random.randint(1, min(max(3, num_vars // 3), num_vars))
-
-                    # 结合 WIR 权重进行变异位置的采样
                     if mutation_probs:
-                        mutate_indices = np.random.choice(range(num_vars), size=num_mutations, replace=False,
-                                                          p=mutation_probs)
+                        mutate_indices = np.random.choice(range(num_vars), size=num_mutations, replace=False, p=mutation_probs)
                     else:
                         mutate_indices = random.sample(range(num_vars), num_mutations)
 
                     for idx in mutate_indices:
                         base_state[idx] = random.randint(0, len(var_candidates[valid_vars[idx]]) - 1)
                     candidate_states.append(base_state)
-                else:  # 20% 全局随机探索
+                else:
                     candidate_states.append([random.randint(0, len(var_candidates[var]) - 1) for var in valid_vars])
 
             unseen_candidates = [s for s in candidate_states if tuple(s) not in seen_states]
-            if not unseen_candidates:
-                continue
+            if not unseen_candidates: continue
 
             unseen_candidates_encoded = encoder.transform(unseen_candidates)
 
-            # c. 计算 UCB
-            tree_predictions = []
-            for tree in rf.estimators_:
-                tree_predictions.append(tree.predict(unseen_candidates_encoded))
-
-            tree_predictions = np.array(tree_predictions)
+            # 计算 UCB
+            tree_predictions = np.array([tree.predict(unseen_candidates_encoded) for tree in rf.estimators_])
             mean_preds = np.mean(tree_predictions, axis=0)
-            std_preds = np.std(tree_predictions, axis=0)
 
-            # 使用动态 Kappa 计算 UCB
+            # 🌟 修复 5：加入微小方差平滑，防止在前期树未充分生长时 std 崩溃为 0 导致纯贪婪
+            std_preds = np.std(tree_predictions, axis=0) + 1e-6
+
             ucb_scores = mean_preds + current_kappa * std_preds
-
-            # d. 选出 UCB 得分最高的一个状态进行真实模型的评估
             best_candidate_idx = np.argmax(ucb_scores)
             chosen_state = unseen_candidates[best_candidate_idx]
 
@@ -643,35 +703,17 @@ class BayesianOptimizer:
                 seen_states.add(tuple(chosen_state))
                 continue
 
-            # e. 在目标模型上进行真实查询
             probs, pred = self.model_zoo.predict(mutated_code, self.target_model)
             fitness = self._calculate_fitness(probs, original_pred)
 
-            target_idx = min(1 if original_pred == -1 else 0, len(probs) - 1)
-            current_target_prob = self._get_target_prob(probs, original_pred)
-            # f. 更新记录
             seen_states.add(tuple(chosen_state))
             X_history.append(chosen_state)
             Y_history.append(fitness)
 
-            # 监控日志：动态打印探索过程
-            if fitness > best_fitness:
-                print(f"[Iter {iteration + 1:02d}/{total_bo_iters}] 🌟 突破! "
-                      f"当前适应度: {fitness:.4f} (↑) | 目标概率: {current_target_prob:.2%} | 预测标签: {pred}")
-            else:
-                print(f"[Iter {iteration + 1:02d}/{total_bo_iters}] 探索中... "
-                      f"当前适应度: {fitness:.4f} | 目标概率: {current_target_prob:.2%} | 历史最优: {best_fitness:.4f}")
-
             if pred != original_pred and self.run_mode == "attack":
-                print(f"\n🎉 攻击成功！在第 {iteration + 1} 次迭代突破防线。最终目标概率: {current_target_prob:.2%}")
                 return True, mutated_code, probs, pred
 
             if fitness > best_fitness:
-                best_fitness = fitness
-                best_code = mutated_code
-                best_probs = probs
-                best_pred = pred
+                best_fitness, best_code, best_probs, best_pred = fitness, mutated_code, probs, pred
 
-        final_target_prob = self._get_target_prob(best_probs, original_pred)
-        print(f"\n⚠️ 攻击结束。未能改变模型预测。最终目标概率峰值: {final_target_prob:.2%}")
         return (best_pred != original_pred), best_code, best_probs, best_pred
